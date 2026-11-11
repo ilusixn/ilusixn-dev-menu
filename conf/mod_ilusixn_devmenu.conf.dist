@@ -18,3 +18,9 @@ DevMenu.Enable = 1
 DevMenu.MinSecurity = 2
 
 ###################################################################################################
+
+#    DevMenu.Items.FirstId
+#        Description: First id of the 9999 item ids the "Create an item" tab uses. 0 = 9400001. Change it only if those ids are taken.
+#        Default:     0
+
+DevMenu.Items.FirstId = 0

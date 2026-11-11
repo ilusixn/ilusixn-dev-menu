@@ -14,6 +14,10 @@
 #include "CreatureData.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "GameEventMgr.h"
+#include "GameTime.h"
+#include "WorldSessionMgr.h"
+#include "ReputationMgr.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "Log.h"
@@ -42,6 +46,8 @@
 #include "ServerScript.h"
 #include "Opcodes.h"
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -2256,7 +2262,7 @@ namespace
     {
         static std::vector<std::set<uint32>> const types = {
             { 1 }, { 3 }, { 4 }, { 5, 20 }, { 6 }, { 7 }, { 8 }, { 9 }, { 10 }, { 16 }, { 19 },
-            { 13, 17, 21 }, { 13, 14, 22, 23 }, { 15, 25, 26 },
+            { 13, 17, 21 }, { 13, 14, 22, 23 }, { 15, 25, 26 }, {},
         };
         std::string q = Lower(S(a, 2));
         uint32 slot = std::min<uint32>(U(a, 3), uint32(types.size() - 1));
@@ -2268,7 +2274,7 @@ namespace
         std::vector<ItemTemplate const*> hits;
         for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
         {
-            if (!types[slot].count(it.InventoryType) || !it.DisplayInfoID)
+            if ((!types[slot].empty() && !types[slot].count(it.InventoryType)) || !it.DisplayInfoID)
                 continue;
             if (!q.empty() && id != qid && Lower(it.Name1).find(q) == std::string::npos)
                 continue;
@@ -2484,7 +2490,9 @@ namespace
         out << "-- Made with ilusixn Dev Menu (" << stamp << "). World database. Safe to run more than once.\n";
         if (!coa)
             out << "CREATE TABLE IF NOT EXISTS `coa_npc_outfit` (`entry` INT UNSIGNED NOT NULL PRIMARY KEY, `outfit` VARCHAR(600) NOT NULL, "
-                   "`comment` VARCHAR(100) NOT NULL DEFAULT '') ENGINE=InnoDB COMMENT='Dev Menu: player-race NPC looks';\n";
+                   "`comment` VARCHAR(100) NOT NULL DEFAULT '') ENGINE=InnoDB COMMENT='Dev Menu: player-race NPC looks';\n"
+                   "CREATE TABLE IF NOT EXISTS `coa_devmenu_heirloom` (`entry` INT UNSIGNED NOT NULL PRIMARY KEY, `stats` VARCHAR(200) NOT NULL, "
+                   "`max_level` TINYINT UNSIGNED NOT NULL DEFAULT 80) ENGINE=InnoDB COMMENT='Dev Menu: heirloom items, stat gained per level';\n";
         uint32 rows = 0;
         std::string skippedLooks, keptTemplates;
         do
@@ -2545,13 +2553,932 @@ namespace
         Send(p, Join("SQLF", Clean(full, 220), rows));
     }
 
+    // ====================================================================================================
+    // Create an item (item_template rows in the dev range) and heirlooms that grow with your level
+    // ====================================================================================================
+    // The dev item range starts at 9400001 (DevMenu.Items.FirstId overrides it); LoadHeirlooms grows the fast id table once at startup so a stock core fits.
+    uint32 ITEM_FIRST = 9400001, ITEM_LAST = 9409999;
+
+    struct HeirStat { uint32 type; float per; };
+    struct Heirloom { std::vector<HeirStat> st; uint32 maxLevel = 80; };
+    std::map<uint32, Heirloom> g_heir;
+    std::mutex g_heirLock;
+    std::atomic<bool> g_heirAny{ false };
+    std::unordered_map<ObjectGuid::LowType, std::vector<std::pair<uint32, int32>>> g_heirApplied;
+    std::unordered_map<ObjectGuid::LowType, uint32> g_heirTimer;
+
+    char const* StatLabel(uint32 t)
+    {
+        switch (t)
+        {
+            case 0: return "Mana"; case 1: return "Health"; case 3: return "Agility"; case 4: return "Strength"; case 5: return "Intellect";
+            case 6: return "Spirit"; case 7: return "Stamina"; case 12: return "Defense rating"; case 13: return "Dodge rating";
+            case 14: return "Parry rating"; case 15: return "Block rating"; case 31: return "Hit rating"; case 32: return "Crit rating";
+            case 35: return "Resilience rating"; case 36: return "Haste rating"; case 37: return "Expertise rating"; case 38: return "Attack power";
+            case 39: return "Ranged attack power"; case 43: return "Mana per 5 sec"; case 44: return "Armor penetration"; case 45: return "Spell power";
+            case 46: return "Health per 5 sec"; case 47: return "Spell penetration";
+        }
+        return nullptr;
+    }
+
+    // "7:1.5,4:1" -> stats that grow per level
+    std::vector<HeirStat> ParseHeir(std::string const& s)
+    {
+        std::vector<HeirStat> out;
+        for (std::string const& part : Split(s, ','))
+        {
+            size_t c = part.find(':');
+            if (c == std::string::npos)
+                continue;
+            uint32 t = uint32(std::strtoul(part.c_str(), nullptr, 10));
+            float per = std::strtof(part.c_str() + c + 1, nullptr);
+            if (StatLabel(t) && per > 0.f && per < 1000.f && out.size() < 5)
+                out.push_back({ t, per });
+        }
+        return out;
+    }
+
+    std::string HeirText(Heirloom const& h)
+    {
+        std::string t = "Heirloom: grows with your level (";
+        for (size_t i = 0; i < h.st.size(); ++i)
+        {
+            char buf[64];
+            snprintf(buf, sizeof buf, "%+g", double(h.st[i].per));
+            t += (i ? ", " : "") + std::string(buf) + " " + StatLabel(h.st[i].type);
+        }
+        return t + " per level, up to level " + std::to_string(h.maxLevel) + ").";
+    }
+
+    void LoadHeirlooms()
+    {
+        WorldDatabase.DirectExecute("CREATE TABLE IF NOT EXISTS coa_devmenu_heirloom (entry INT UNSIGNED NOT NULL PRIMARY KEY, stats VARCHAR(200) NOT NULL, "
+            "max_level TINYINT UNSIGNED NOT NULL DEFAULT 80) ENGINE=InnoDB COMMENT='Dev Menu: heirloom items, stat gained per level'");
+        std::lock_guard<std::mutex> lock(g_heirLock);
+        g_heir.clear();
+        if (QueryResult r = WorldDatabase.Query("SELECT entry, stats, max_level FROM coa_devmenu_heirloom"))
+            do
+            {
+                Heirloom h;
+                h.st = ParseHeir(r->Fetch()[1].Get<std::string>());
+                h.maxLevel = r->Fetch()[2].Get<uint8>();
+                if (!h.st.empty())
+                    g_heir[r->Fetch()[0].Get<uint32>()] = h;
+            } while (r->NextRow());
+        g_heirAny = !g_heir.empty();
+        // room for new item templates without the store ever rehashing while maps run
+        auto& store = const_cast<ItemTemplateContainer&>(*sObjectMgr->GetItemTemplateStore());
+        store.reserve(store.size() + 20000);
+        auto& fast = const_cast<std::vector<ItemTemplate*>&>(*sObjectMgr->GetItemTemplateStoreFast());
+        uint32 maxId = fast.empty() ? 0 : uint32(fast.size() - 1);
+        uint32 first = sConfigMgr->GetOption<uint32>("DevMenu.Items.FirstId", 0);
+        if (!first)
+            first = 9400001;
+        ITEM_FIRST = first; ITEM_LAST = first + 9998;
+        if (fast.size() <= ITEM_LAST)
+            fast.resize(ITEM_LAST + 1, nullptr);   // done once at startup, before any map thread reads the table
+        LOG_INFO("module", ">> Dev Menu: new items use ids {}-{}", ITEM_FIRST, ITEM_LAST);
+        LOG_INFO("module", ">> Dev Menu: {} heirloom items", g_heir.size());
+    }
+
+    void ApplyBonusStat(Player* p, uint32 t, int32 v, bool apply)
+    {
+        float f = float(v);
+        switch (t)
+        {
+            case 0: p->HandleStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, f, apply); break;
+            case 1: p->HandleStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, f, apply); break;
+            case 3: p->HandleStatFlatModifier(UNIT_MOD_STAT_AGILITY, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_AGILITY); break;
+            case 4: p->HandleStatFlatModifier(UNIT_MOD_STAT_STRENGTH, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STRENGTH); break;
+            case 5: p->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_INTELLECT); break;
+            case 6: p->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_SPIRIT); break;
+            case 7: p->HandleStatFlatModifier(UNIT_MOD_STAT_STAMINA, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STAMINA); break;
+            case 12: p->ApplyRatingMod(CR_DEFENSE_SKILL, v, apply); break;
+            case 13: p->ApplyRatingMod(CR_DODGE, v, apply); break;
+            case 14: p->ApplyRatingMod(CR_PARRY, v, apply); break;
+            case 15: p->ApplyRatingMod(CR_BLOCK, v, apply); break;
+            case 31: p->ApplyRatingMod(CR_HIT_MELEE, v, apply); p->ApplyRatingMod(CR_HIT_RANGED, v, apply); p->ApplyRatingMod(CR_HIT_SPELL, v, apply); break;
+            case 32: p->ApplyRatingMod(CR_CRIT_MELEE, v, apply); p->ApplyRatingMod(CR_CRIT_RANGED, v, apply); p->ApplyRatingMod(CR_CRIT_SPELL, v, apply); break;
+            case 35: p->ApplyRatingMod(CR_CRIT_TAKEN_MELEE, v, apply); p->ApplyRatingMod(CR_CRIT_TAKEN_RANGED, v, apply); p->ApplyRatingMod(CR_CRIT_TAKEN_SPELL, v, apply); break;
+            case 36: p->ApplyRatingMod(CR_HASTE_MELEE, v, apply); p->ApplyRatingMod(CR_HASTE_RANGED, v, apply); p->ApplyRatingMod(CR_HASTE_SPELL, v, apply); break;
+            case 37: p->ApplyRatingMod(CR_EXPERTISE, v, apply); break;
+            case 38: p->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE, f, apply); p->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, f, apply); break;
+            case 39: p->HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, f, apply); break;
+            case 43: p->ApplyManaRegenBonus(v, apply); break;
+            case 44: p->ApplyRatingMod(CR_ARMOR_PENETRATION, v, apply); break;
+            case 45: p->ApplySpellPowerBonus(v, apply); break;
+            case 46: p->ApplyHealthRegenBonus(v, apply); break;
+            case 47: p->ApplySpellPenetrationBonus(v, apply); break;
+        }
+    }
+
+    // what the equipped heirlooms add at the player's level; re-applied only when it changes
+    void RefreshHeirlooms(Player* p)
+    {
+        std::vector<std::pair<uint32, int32>> want, old;
+        {
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            std::map<uint32, float> sum;
+            for (uint8 s = EQUIPMENT_SLOT_START; s < EQUIPMENT_SLOT_END; ++s)
+            {
+                Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, s);
+                if (!it || it->IsBroken())
+                    continue;
+                auto h = g_heir.find(it->GetEntry());
+                if (h == g_heir.end())
+                    continue;
+                uint32 lv = std::min<uint32>(p->GetLevel(), h->second.maxLevel);
+                for (HeirStat const& st : h->second.st)
+                    sum[st.type] += st.per * float(lv);
+            }
+            for (auto const& [t, v] : sum)
+                if (int32(v) != 0)
+                    want.push_back({ t, int32(v) });
+            auto& cur = g_heirApplied[p->GetGUID().GetCounter()];
+            if (cur == want)
+                return;
+            old = cur;
+            cur = want;
+        }
+        for (auto const& [t, v] : old)
+            ApplyBonusStat(p, t, v, false);
+        for (auto const& [t, v] : want)
+            ApplyBonusStat(p, t, v, true);
+        p->UpdateAllStats();
+    }
+
+    void HeirloomTick(Player* p, uint32 diff)
+    {
+        if (!g_heirAny)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            uint32& t = g_heirTimer[p->GetGUID().GetCounter()];
+            t += diff;
+            if (t < 1000)
+                return;
+            t = 0;
+        }
+        RefreshHeirlooms(p);
+    }
+
+    // "k=v;k=v" (the client sends it in chunks through BUF)
+    std::map<std::string, std::string> ParseSpec(std::string const& s)
+    {
+        std::map<std::string, std::string> out;
+        for (std::string const& kv : Split(s, ';'))
+        {
+            size_t e = kv.find('=');
+            if (e != std::string::npos)
+                out[kv.substr(0, e)] = kv.substr(e + 1);
+        }
+        return out;
+    }
+
+    int64 SpecInt(std::map<std::string, std::string> const& m, char const* k, int64 def, int64 lo, int64 hi)
+    {
+        auto it = m.find(k);
+        if (it == m.end() || it->second.empty())
+            return def;
+        return std::max(lo, std::min(hi, int64(std::strtoll(it->second.c_str(), nullptr, 10))));
+    }
+
+    float SpecFloat(std::map<std::string, std::string> const& m, char const* k, float def, float lo, float hi)
+    {
+        auto it = m.find(k);
+        if (it == m.end() || it->second.empty())
+            return def;
+        return std::max(lo, std::min(hi, std::strtof(it->second.c_str(), nullptr)));
+    }
+
+    // the client caches item data by id: send the new version so tooltips update at once
+    void PushItem(Player* p, uint32 id) { p->GetSession()->SendItemQuerySingleResponse(id); }
+
+    // IMAKE : spec in the BUF text. id=0 makes a new item, id in range edits one made before
+    void OpItemMake(Player* p, std::vector<std::string> const&)
+    {
+        std::string& buf = g_buf[p->GetGUID().GetCounter()];
+        auto m = ParseSpec(buf);
+        buf.clear();
+        std::string name = Clean(m["name"], 100);
+        if (name.empty())
+            return Err(p, "Give the item a name");
+        uint32 id = uint32(SpecInt(m, "id", 0, 0, 4294967295LL));
+        if (id && (id < ITEM_FIRST || id > ITEM_LAST))
+            return Err(p, "Only items made with the dev menu can be edited");
+        if (!id && !(id = NextFree("item_template", "entry", ITEM_FIRST, ITEM_LAST)))
+            return Err(p, "No free item id left");
+
+        uint32 cls = uint32(SpecInt(m, "cls", 4, 0, 15)), sub = uint32(SpecInt(m, "sub", 0, 0, 20));
+        uint32 q = uint32(SpecInt(m, "q", 4, 0, 7)), inv = uint32(SpecInt(m, "inv", 0, 0, 28));
+        uint32 disp = uint32(SpecInt(m, "disp", 0, 0, 1000000)), ilvl = uint32(SpecInt(m, "ilvl", 1, 0, 1000)), rlvl = uint32(SpecInt(m, "rlvl", 0, 0, 255));
+        uint32 bond = uint32(SpecInt(m, "bond", 0, 0, 3));
+        int64 buy = SpecInt(m, "buy", 0, 0, 2000000000), sell = SpecInt(m, "sell", 0, 0, 2000000000);
+        uint32 armor = uint32(SpecInt(m, "armor", 0, 0, 100000)), block = uint32(SpecInt(m, "blk", 0, 0, 100000));
+        float dmin = SpecFloat(m, "dmin", 0, 0, 100000), dmax = SpecFloat(m, "dmax", 0, 0, 100000);
+        uint32 delay = uint32(SpecInt(m, "dspd", 1000, 100, 10000));
+        int32 spell = int32(SpecInt(m, "sp", 0, 0, 2000000)), trig = int32(SpecInt(m, "spt", 1, 0, 6));
+        int32 stack = int32(SpecInt(m, "stack", 1, 1, 1000)), maxc = int32(SpecInt(m, "maxc", 0, 0, 1000));
+        uint32 dur = uint32(SpecInt(m, "dur", 0, 0, 65000)), mat = uint32(SpecInt(m, "mat", 0, 0, 20)), sheath = uint32(SpecInt(m, "sheath", 0, 0, 7));
+        bool bound = SpecInt(m, "bound", 0, 0, 1) != 0;
+        uint32 stT[10] = {}; int32 stV[10] = {};
+        uint32 nst = 0;
+        for (int i = 0; i < 10; ++i)
+        {
+            auto it = m.find("s" + std::to_string(i + 1));
+            if (it == m.end())
+                continue;
+            size_t c = it->second.find(':');
+            if (c == std::string::npos)
+                continue;
+            uint32 t = uint32(std::strtoul(it->second.c_str(), nullptr, 10));
+            int32 v = int32(std::strtol(it->second.c_str() + c + 1, nullptr, 10));
+            if (v && StatLabel(t))
+            {
+                stT[nst] = t; stV[nst] = v; ++nst;
+            }
+        }
+
+        Heirloom heir;
+        heir.st = ParseHeir(m["hv"]);
+        heir.maxLevel = uint32(SpecInt(m, "hmax", 80, 1, 255));
+        std::string desc = Clean(m["desc"], 300);
+        if (!heir.st.empty())
+        {
+            q = 7; bound = true;
+            desc += (desc.empty() ? "" : " ") + HeirText(heir);
+        }
+        uint32 flags = bound ? 0x08000000u : 0u;
+
+        std::ostringstream sql;
+        sql << "REPLACE INTO item_template (entry, class, subclass, name, displayid, Quality, Flags, BuyPrice, SellPrice, InventoryType, ItemLevel, RequiredLevel, "
+            << "maxcount, stackable, dmg_min1, dmg_max1, dmg_type1, armor, delay, spellid_1, spelltrigger_1, bonding, description, Material, sheath, block, MaxDurability";
+        for (uint32 i = 0; i < 10; ++i)
+            sql << ", stat_type" << (i + 1) << ", stat_value" << (i + 1);
+        sql << ") VALUES (" << id << ", " << cls << ", " << sub << ", '" << Esc(name) << "', " << disp << ", " << q << ", " << flags << ", " << buy << ", " << sell
+            << ", " << inv << ", " << ilvl << ", " << rlvl << ", " << maxc << ", " << stack << ", " << dmin << ", " << dmax << ", 0, " << armor << ", " << delay
+            << ", " << spell << ", " << trig << ", " << bond << ", '" << Esc(desc) << "', " << mat << ", " << sheath << ", " << block << ", " << dur;
+        for (uint32 i = 0; i < 10; ++i)
+            sql << ", " << stT[i] << ", " << stV[i];
+        sql << ")";
+        WorldDatabase.DirectExecute("{}", sql.str());
+
+        // the in-memory template, in place (existing copies of the item see it at once)
+        auto& store = const_cast<ItemTemplateContainer&>(*sObjectMgr->GetItemTemplateStore());
+        ItemTemplate& t = store[id];
+        t = ItemTemplate();
+        t.ItemId = id; t.Class = cls; t.SubClass = sub; t.SoundOverrideSubclass = -1; t.Name1 = name; t.DisplayInfoID = disp; t.Quality = q;
+        t.Flags = ItemFlags(flags); t.BuyCount = 1; t.BuyPrice = int32(buy); t.SellPrice = uint32(sell); t.InventoryType = inv;
+        t.AllowableClass = GetItemAllowableClassMask(uint32(int32(-1))); t.AllowableRace = uint32(int32(-1));
+        t.ItemLevel = ilvl; t.RequiredLevel = rlvl; t.MaxCount = maxc; t.Stackable = stack;
+        t.StatsCount = nst;
+        for (uint32 i = 0; i < nst; ++i)
+        {
+            t.ItemStat[i].ItemStatType = stT[i]; t.ItemStat[i].ItemStatValue = stV[i];
+        }
+        t.Damage[0].DamageMin = dmin; t.Damage[0].DamageMax = dmax;
+        t.Armor = armor; t.Delay = delay; t.Bonding = bond; t.Description = desc; t.Material = int32(mat); t.Sheath = sheath; t.Block = block; t.MaxDurability = dur;
+        t.RequiredDisenchantSkill = uint32(int32(-1));
+        for (auto& sp : t.Spells)
+        {
+            sp.SpellCooldown = -1; sp.SpellCategoryCooldown = -1;
+        }
+        t.Spells[0].SpellId = spell; t.Spells[0].SpellTrigger = uint32(trig);
+        auto& fast = const_cast<std::vector<ItemTemplate*>&>(*sObjectMgr->GetItemTemplateStoreFast());
+        if (id < fast.size())
+            fast[id] = &t;
+
+        if (!heir.st.empty())
+        {
+            std::string spec;
+            for (size_t i = 0; i < heir.st.size(); ++i)
+                spec += (i ? "," : "") + std::to_string(heir.st[i].type) + ":" + std::to_string(heir.st[i].per);
+            WorldDatabase.DirectExecute("REPLACE INTO coa_devmenu_heirloom (entry, stats, max_level) VALUES ({}, '{}', {})", id, spec, heir.maxLevel);
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            g_heir[id] = heir;
+            g_heirAny = true;
+        }
+        else
+        {
+            WorldDatabase.DirectExecute("DELETE FROM coa_devmenu_heirloom WHERE entry = {}", id);
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            g_heir.erase(id);
+            g_heirAny = !g_heir.empty();
+        }
+        Mark("item_template", Eq("entry", id));
+        Mark("coa_devmenu_heirloom", Eq("entry", id));
+        PushItem(p, id);
+        Ok(p, "Saved " + name);
+        Send(p, Join("IMK", id, name));
+    }
+
+    void OpItemDelete(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = U(a, 2);
+        if (id < ITEM_FIRST || id > ITEM_LAST)
+            return Err(p, "Only items made with the dev menu can be deleted");
+        Mark("item_template", Eq("entry", id));
+        Mark("coa_devmenu_heirloom", Eq("entry", id));
+        WorldDatabase.DirectExecute("DELETE FROM item_template WHERE entry = {}", id);
+        WorldDatabase.DirectExecute("DELETE FROM coa_devmenu_heirloom WHERE entry = {}", id);
+        {
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            g_heir.erase(id);
+            g_heirAny = !g_heir.empty();
+        }
+        Ok(p, "Item deleted (copies already in bags vanish after a server restart)");
+        Send(p, Join("IDL", id));
+    }
+
+    // ILIST : the items made with the menu, newest first
+    void OpItemList(Player* p)
+    {
+        Send(p, "ILB~0");
+        if (QueryResult r = WorldDatabase.Query("SELECT entry, name, Quality, displayid, InventoryType FROM item_template WHERE entry BETWEEN {} AND {} ORDER BY entry DESC LIMIT 80", ITEM_FIRST, ITEM_LAST))
+            do
+            {
+                Field* f = r->Fetch();
+                Send(p, Join("ILR", f[0].Get<uint32>(), Clean(f[1].Get<std::string>(), 60), uint32(f[2].Get<uint8>()), f[3].Get<uint32>(), uint32(f[4].Get<uint8>())));
+            } while (r->NextRow());
+        Send(p, "ILE~0");
+    }
+
+    // IGET~id : every field of an item made with the menu, to edit it
+    void OpItemGet(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = U(a, 2);
+        ItemTemplate const* t = sObjectMgr->GetItemTemplate(id);
+        if (!t)
+            return Err(p, "No item with that id");
+        auto kv = [&](std::string const& k, std::string const& v) { Send(p, Join("IGK", k, v)); };
+        kv("id", std::to_string(id)); kv("name", Clean(t->Name1, 100));
+        std::string desc = t->Description;
+        size_t h = desc.find("Heirloom: grows");
+        if (h != std::string::npos)
+            desc = desc.substr(0, h > 0 ? h - 1 : 0);   // rebuilt from the stats on save
+        kv("desc", Clean(desc, 200));
+        kv("cls", std::to_string(t->Class)); kv("sub", std::to_string(t->SubClass)); kv("q", std::to_string(t->Quality)); kv("inv", std::to_string(t->InventoryType));
+        kv("disp", std::to_string(t->DisplayInfoID)); kv("ilvl", std::to_string(t->ItemLevel)); kv("rlvl", std::to_string(t->RequiredLevel));
+        kv("bond", std::to_string(t->Bonding)); kv("buy", std::to_string(t->BuyPrice)); kv("sell", std::to_string(t->SellPrice));
+        kv("armor", std::to_string(t->Armor)); kv("blk", std::to_string(t->Block));
+        kv("dmin", std::to_string(int(t->Damage[0].DamageMin))); kv("dmax", std::to_string(int(t->Damage[0].DamageMax))); kv("dspd", std::to_string(t->Delay));
+        kv("sp", std::to_string(t->Spells[0].SpellId)); kv("spt", std::to_string(t->Spells[0].SpellTrigger));
+        kv("stack", std::to_string(t->Stackable)); kv("maxc", std::to_string(t->MaxCount)); kv("dur", std::to_string(t->MaxDurability));
+        kv("mat", std::to_string(t->Material)); kv("sheath", std::to_string(t->Sheath)); kv("bound", (uint32(t->Flags) & 0x08000000u) ? "1" : "0");
+        for (uint32 i = 0; i < t->StatsCount; ++i)
+            kv("s" + std::to_string(i + 1), std::to_string(t->ItemStat[i].ItemStatType) + ":" + std::to_string(t->ItemStat[i].ItemStatValue));
+        {
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            auto hv = g_heir.find(id);
+            if (hv != g_heir.end())
+            {
+                std::string spec;
+                for (size_t i = 0; i < hv->second.st.size(); ++i)
+                {
+                    char buf[48];
+                    snprintf(buf, sizeof buf, "%u:%g", hv->second.st[i].type, double(hv->second.st[i].per));
+                    spec += (i ? "," : "") + std::string(buf);
+                }
+                kv("hv", spec); kv("hmax", std::to_string(hv->second.maxLevel));
+            }
+        }
+        Send(p, "IGE~0");
+    }
+
+    // IGIVE~id~count : any item into your bags
+    void OpItemGive(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = U(a, 2), n = std::max<uint32>(1, std::min<uint32>(U(a, 3, 1), 1000));
+        ItemTemplate const* t = sObjectMgr->GetItemTemplate(id);
+        if (!t)
+            return Err(p, "No item with that id");
+        if (!p->AddItem(id, n))
+            return Err(p, "Your bags are full");
+        Ok(p, "Added " + Clean(t->Name1, 50));
+    }
+
+    // ====================================================================================================
+    // Your character tab
+    // ====================================================================================================
+    void RunCommand(Player* p, std::string const& cmd)
+    {
+        ChatHandler(p->GetSession()).ParseCommands(cmd);
+    }
+
+    void SendMeState(Player* p)
+    {
+        Send(p, Join("MS", p->IsGameMaster() ? 1 : 0, p->GetCommandStatus(CHEAT_GOD) ? 1 : 0, p->GetCommandStatus(CHEAT_CASTTIME) ? 1 : 0,
+            p->GetCommandStatus(CHEAT_COOLDOWN) ? 1 : 0, p->GetCommandStatus(CHEAT_POWER) ? 1 : 0, p->GetCommandStatus(CHEAT_WATERWALK) ? 1 : 0,
+            p->isGMChat() ? 1 : 0, p->CanFly() ? 1 : 0, p->isTaxiCheater() ? 1 : 0, uint32(p->GetLevel()), uint32(p->GetMoney() / 10000)));
+    }
+
+    // heirlooms of the retail game, per class: shoulders, chest, rings and trinkets, weapons
+    std::vector<uint32> HeirloomSet(Player* p, bool all)
+    {
+        static std::vector<uint32> const everything = { 42985, 44107, 42950, 42951, 42952, 42984, 44101, 44102, 44103, 44105, 42949, 44099, 44100, 48677, 48683, 48687,
+            48689, 48685, 48691, 50255, 42991, 42992, 44097, 44098, 48716, 44096, 42944, 44091, 42946, 42943, 48718, 44092, 42947, 44095, 42948, 44094, 42945, 44093, 69, 52887, 57403 };
+        if (all)
+            return everything;
+        bool horde = p->GetTeamId() == TEAM_HORDE;
+        std::vector<uint32> out = { 50255, 42991, 42992, horde ? 44097u : 44098u };
+        auto add = [&](std::initializer_list<uint32> l) { out.insert(out.end(), l); };
+        switch (p->getClass())
+        {
+            case CLASS_WARRIOR:      add({ 42949, 48685, 42943, 44092, 42945, 44096, 42946, 44093 }); break;
+            case CLASS_PALADIN:      add({ 42949, 48685, 42948, 44094, 44092, 42945, 48716, 48718 }); break;
+            case CLASS_HUNTER:       add({ 44101, 48683, 42946, 44093, 42943, 44092, 42947, 44095, 42944 }); break;
+            case CLASS_ROGUE:        add({ 42952, 48689, 44091, 42944, 44096, 42945, 48716, 42946, 44093 }); break;
+            case CLASS_PRIEST:       add({ 42985, 48691, 42947, 44095, 44091, 48716, 44094, 69 }); break;
+            case CLASS_DEATH_KNIGHT: add({ 42949, 48685, 42943, 44092, 42948, 42945, 44096, 48716, 48718 }); break;
+            case CLASS_SHAMAN:       add({ 42951, 48683, 44094, 48716, 42944, 42947, 44095, 48718 }); break;
+            case CLASS_MAGE:         add({ 42985, 48691, 42947, 44095, 44091, 44096, 69 }); break;
+            case CLASS_WARLOCK:      add({ 42985, 48691, 42947, 44095, 44091, 44096, 69 }); break;
+            case CLASS_DRUID:        add({ 42984, 48687, 42947, 44095, 48716, 44094, 44091, 48718 }); break;
+            default: return everything;
+        }
+        return out;
+    }
+
+    std::string SetName(ItemSetEntry const* s)
+    {
+        for (char const* n : s->name)
+            if (n && *n)
+                return n;
+        return "";
+    }
+
+    // MESETS~text~page~mineOnly : item sets (PvP seasons, raid tiers, dungeon sets...)
+    void OpMeSets(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3);
+        bool mineOnly = U(a, 4) != 0;
+        uint32 lvl = U(a, 5);   // 0 = any, else sets whose highest required level is in lvl..lvl+9 (1 = 0..9)
+        struct Row { uint32 id; std::string name; uint32 ilvl, count; };
+        std::vector<Row> hits;
+        for (uint32 i = 1; i < sItemSetStore.GetNumRows(); ++i)
+        {
+            ItemSetEntry const* s = sItemSetStore.LookupEntry(i);
+            if (!s)
+                continue;
+            std::string name = SetName(s);
+            if (name.empty() || (!q.empty() && Lower(name).find(q) == std::string::npos))
+                continue;
+            uint32 n = 0, ilvl = 0, req = 0;
+            bool usable = true;
+            for (uint32 id : s->itemId)
+            {
+                ItemTemplate const* it = id ? sObjectMgr->GetItemTemplate(id) : nullptr;
+                if (!it)
+                    continue;
+                ++n;
+                ilvl = std::max(ilvl, it->ItemLevel);
+                req = std::max(req, it->RequiredLevel);
+                if (!(it->AllowableClass & p->getClassMask()))
+                    usable = false;
+            }
+            if (!n || (mineOnly && !usable))
+                continue;
+            if (lvl && (req < (lvl == 1 ? 0 : lvl) || req > lvl + 9))
+                continue;
+            hits.push_back({ i, name, ilvl, n });
+        }
+        std::sort(hits.begin(), hits.end(), [](Row const& x, Row const& y) { return x.ilvl != y.ilvl ? x.ilvl > y.ilvl : x.name < y.name; });
+        uint32 total = uint32(hits.size()), per = 12, pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("MSB", total, page, pages));
+        for (uint32 i = page * per; i < std::min(total, (page + 1) * per); ++i)
+            Send(p, Join("MSR", hits[i].id, Clean(hits[i].name, 60), hits[i].ilvl, hits[i].count));
+        Send(p, Join("MSE", total, page, pages));
+    }
+
+    void GiveList(Player* p, std::vector<uint32> const& items, std::string const& what)
+    {
+        uint32 given = 0, full = 0;
+        for (uint32 id : items)
+        {
+            if (!sObjectMgr->GetItemTemplate(id))
+                continue;
+            if (p->AddItem(id, 1))
+                ++given;
+            else
+                ++full;
+        }
+        if (full)
+            Err(p, "Bags full: " + std::to_string(full) + " items not added");
+        Ok(p, what + ": " + std::to_string(given) + " items added");
+    }
+
+    void LearnAllMounts(Player* p)
+    {
+        uint32 learned = 0;
+        for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+        {
+            if (it.Class != ITEM_CLASS_MISC || it.SubClass != 5 || !it.Spells[0].SpellId)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(it.Spells[0].SpellId);
+            if (!si)
+                continue;
+            uint32 mountSpell = 0;
+            for (SpellEffectInfo const& e : si->Effects)
+            {
+                if (e.Effect == SPELL_EFFECT_LEARN_SPELL && e.TriggerSpell)
+                    mountSpell = e.TriggerSpell;
+                else if (e.Effect == SPELL_EFFECT_APPLY_AURA && e.ApplyAuraName == SPELL_AURA_MOUNTED)
+                    mountSpell = si->Id;
+            }
+            if (mountSpell && !p->HasSpell(mountSpell) && sSpellMgr->GetSpellInfo(mountSpell))
+            {
+                p->learnSpell(mountSpell);
+                ++learned;
+            }
+        }
+        Ok(p, "Learned " + std::to_string(learned) + " mounts");
+    }
+
+    // REPSEARCH~text~page : factions with your standing
+    void OpRepSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3), per = 14;
+        struct Row { uint32 id; std::string name; int32 st; };
+        std::vector<Row> hits;
+        for (uint32 i = 0; i < sFactionStore.GetNumRows(); ++i)
+        {
+            FactionEntry const* f = sFactionStore.LookupEntry(i);
+            if (!f || !f->CanHaveReputation())
+                continue;
+            std::string n;
+            for (char const* c : f->name) if (c && *c) { n = c; break; }
+            if (n.empty() || (!q.empty() && Lower(n).find(q) == std::string::npos))
+                continue;
+            hits.push_back({ i, n, p->GetReputationMgr().GetReputation(f) });
+        }
+        std::sort(hits.begin(), hits.end(), [](Row const& x, Row const& y) { return x.name < y.name; });
+        uint32 total = uint32(hits.size()), pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("RPB", total, page, pages));
+        for (uint32 i = page * per; i < std::min(total, (page + 1) * per); ++i)
+            Send(p, Join("RPR", hits[i].id, Clean(hits[i].name, 50), hits[i].st));
+        Send(p, Join("RPE", total, page, pages));
+    }
+
+    // ME~what~arg... : one-click GM helpers on your own character
+    void OpMe(Player* p, std::vector<std::string> const& a)
+    {
+        std::string w = S(a, 2);
+        bool on = U(a, 3) != 0;
+        auto toggle = [&](char const* base) { RunCommand(p, std::string(".") + base + (on ? " on" : " off")); };
+        if (w == "state") return SendMeState(p);
+        if (w == "gm") toggle("gm");
+        else if (w == "gmfly") toggle("gm fly");
+        else if (w == "gmchat") toggle("gm chat");
+        else if (w == "god") toggle("cheat god");
+        else if (w == "cast") toggle("cheat casttime");
+        else if (w == "cd") toggle("cheat cooldown");
+        else if (w == "power") toggle("cheat power");
+        else if (w == "water") toggle("cheat waterwalk");
+        else if (w == "taxi") { p->SetTaxiCheater(on); Ok(p, on ? "All flight paths unlocked" : "Flight paths back to normal"); }
+        else if (w == "level")
+        {
+            uint32 lv = std::max<uint32>(1, std::min<uint32>(U(a, 3), sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)));
+            p->GiveLevel(lv);
+            p->InitTalentForLevel();
+            p->SetUInt32Value(PLAYER_XP, 0);
+            Ok(p, "Level " + std::to_string(lv));
+        }
+        else if (w == "money")
+        {
+            int64 g = int64(std::strtoll(S(a, 3).c_str(), nullptr, 10));
+            int64 cur = int64(p->GetMoney());
+            int64 next = std::max<int64>(0, std::min<int64>(cur + g * 10000, MAX_MONEY_AMOUNT));
+            p->SetMoney(uint32(next));
+            Ok(p, "You now have " + std::to_string(next / 10000) + " gold");
+        }
+        else if (w == "honor") { p->SetHonorPoints(std::min<uint32>(p->GetHonorPoints() + U(a, 3), 75000)); Ok(p, "Honor added"); }
+        else if (w == "arena") { p->SetArenaPoints(std::min<uint32>(p->GetArenaPoints() + U(a, 3), 5000)); Ok(p, "Arena points added"); }
+        else if (w == "emblem")
+        {
+            static std::map<std::string, uint32> const e = { { "frost", 49426 }, { "triumph", 47241 }, { "conquest", 45624 }, { "heroism", 40752 }, { "valor", 40753 } };
+            auto it = e.find(S(a, 3));
+            if (it == e.end() || !sObjectMgr->GetItemTemplate(it->second))
+                return Err(p, "Unknown emblem");
+            uint32 n = std::max<uint32>(1, std::min<uint32>(U(a, 4, 100), 1000));
+            if (p->AddItem(it->second, n)) Ok(p, std::to_string(n) + " emblems added"); else Err(p, "Your bags are full");
+        }
+        else if (w == "learn")
+        {
+            std::string k = S(a, 3);
+            if (k == "class") RunCommand(p, ".learn all my class");
+            else if (k == "default") RunCommand(p, ".learn all default");
+            else if (k == "lang") RunCommand(p, ".learn all lang");
+            else if (k == "skills") { p->UpdateSkillsToMaxSkillsForLevel(); Ok(p, "Skills raised to the maximum"); }
+            else if (k == "mounts") LearnAllMounts(p);
+            else return Err(p, "Unknown learn option");
+        }
+        else if (w == "explore")
+        {
+            for (uint32 i = 0; i < PLAYER_EXPLORED_ZONES_SIZE; ++i)
+                p->SetUInt32Value(PLAYER_EXPLORED_ZONES_1 + i, 0xFFFFFFFF);
+            Ok(p, "Whole map revealed");
+        }
+        else if (w == "heal")
+        {
+            if (p->isDead()) p->ResurrectPlayer(1.0f);
+            p->SetFullHealth();
+            if (p->GetMaxPower(POWER_MANA)) p->SetPower(POWER_MANA, p->GetMaxPower(POWER_MANA));
+            Ok(p, "Fully healed");
+        }
+        else if (w == "cooldowns") { p->RemoveAllSpellCooldown(); Ok(p, "Cooldowns cleared"); }
+        else if (w == "repair") { p->DurabilityRepairAll(false, 0.0f, false); Ok(p, "Everything repaired"); }
+        else if (w == "speed") { float s = std::max(0.1f, std::min(F(a, 3, 1.f), 50.f)); RunCommand(p, ".modify speed all " + std::to_string(s)); }
+        else if (w == "scale") { float s = std::max(0.1f, std::min(F(a, 3, 1.f), 10.f)); RunCommand(p, ".modify scale " + std::to_string(s)); }
+        else if (w == "rep")
+        {
+            float v = float(std::strtol(S(a, 4).c_str(), nullptr, 10));
+            v = std::max(-42000.f, std::min(v, 42999.f));
+            if (S(a, 3) == "all")
+            {
+                uint32 n = 0;
+                for (uint32 i = 0; i < sFactionStore.GetNumRows(); ++i)
+                    if (FactionEntry const* f = sFactionStore.LookupEntry(i))
+                        if (f->CanHaveReputation()) { p->GetReputationMgr().SetReputation(f, v); ++n; }
+                Ok(p, "Set " + std::to_string(n) + " factions");
+            }
+            else
+            {
+                FactionEntry const* f = sFactionStore.LookupEntry(U(a, 5));
+                if (!f || !f->CanHaveReputation())
+                    return Err(p, "That faction has no reputation");
+                p->GetReputationMgr().SetReputation(f, v);
+                Ok(p, "Reputation set");
+            }
+        }
+        else if (w == "faction")
+        {
+            std::string k = S(a, 3);
+            if (k == "neutral") { p->SetFaction(35); Ok(p, "Friendly to everyone until you log out"); }
+            else
+            {
+                TeamId want = k == "horde" ? TEAM_HORDE : TEAM_ALLIANCE;
+                if (p->GetTeamId() == want)
+                    Ok(p, "You are already in that faction");
+                else
+                {
+                    RunCommand(p, ".character changefaction");
+                    Ok(p, "Faction change queued: log out to the character screen to finish it");
+                }
+            }
+        }
+        else if (w == "heirloom") GiveList(p, HeirloomSet(p, S(a, 3) == "all"), "Heirlooms");
+        else if (w == "set")
+        {
+            ItemSetEntry const* s = sItemSetStore.LookupEntry(U(a, 3));
+            if (!s)
+                return Err(p, "No such set");
+            std::vector<uint32> items;
+            for (uint32 id : s->itemId)
+                if (id)
+                    items.push_back(id);
+            GiveList(p, items, SetName(s));
+        }
+        else return Err(p, "Unknown option");
+        SendMeState(p);
+    }
+
+    // ====================================================================================================
+    // Morph tab and Server tab
+    // ====================================================================================================
+    // MORSEARCH~text~page : creature models by the name of a creature that uses them (or a display id)
+    void OpMorphSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string raw = S(a, 2);
+        std::string q = Esc(raw);
+        uint32 page = U(a, 3), per = 14;
+        std::string cond = "1";
+        if (!raw.empty())
+        {
+            cond = "t.name LIKE '%" + q + "%'";
+            if (std::all_of(raw.begin(), raw.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+                cond += " OR m.CreatureDisplayID = " + std::to_string(std::strtoull(raw.c_str(), nullptr, 10));
+        }
+        std::string from = " FROM creature_template_model m JOIN creature_template t ON t.entry = m.CreatureID WHERE " + cond;
+        uint32 total = MaxOf("SELECT COUNT(DISTINCT m.CreatureDisplayID)" + from);
+        uint32 pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("MORB", total, page, pages));
+        if (QueryResult r = WorldDatabase.Query("{}", "SELECT m.CreatureDisplayID, MIN(t.name), MIN(t.entry)" + from + " GROUP BY m.CreatureDisplayID ORDER BY MIN(t.name) LIMIT "
+            + std::to_string(per) + " OFFSET " + std::to_string(page * per)))
+            do
+            {
+                Field* f = r->Fetch();
+                Send(p, Join("MORR", f[0].Get<uint32>(), Clean(f[1].Get<std::string>(), 60), f[2].Get<uint32>()));
+            } while (r->NextRow());
+        Send(p, Join("MORE", total, page, pages));
+    }
+
+    // MORPH~displayid (0 = back to normal)
+    void OpMorph(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = U(a, 2);
+        if (!id)
+        {
+            p->DeMorph();
+            Ok(p, "Back to normal");
+            return Send(p, Join("MORN", 0));
+        }
+        if (!sCreatureDisplayInfoStore.LookupEntry(id))
+            return Err(p, "No model with that display id");
+        p->SetDisplayId(id);
+        // a creature that uses this model: send its data to the client so the panel can draw it
+        uint32 entry = MaxOf("SELECT IFNULL(MIN(CreatureID), 0) FROM creature_template_model WHERE CreatureDisplayID = " + std::to_string(id));
+        if (entry && sObjectMgr->GetCreatureTemplate(entry))
+        {
+            WorldPacket q(CMSG_CREATURE_QUERY, 12);
+            q << uint32(entry) << uint64(0);
+            p->GetSession()->HandleCreatureQueryOpcode(q);
+        }
+        else
+            entry = 0;
+        Ok(p, "Morphed into display " + std::to_string(id));
+        Send(p, Join("MORN", id, entry));
+    }
+
+    // ICONSEARCH~icon~page : items (one per look) whose inventory icon is that texture; answers like ISEARCH
+    void OpIconSearch(Player* p, std::vector<std::string> const& a)
+    {
+        auto base = [](std::string s)
+        {
+            s = Lower(s);
+            size_t c = s.find_last_of("\\/");
+            return c == std::string::npos ? s : s.substr(c + 1);
+        };
+        std::string icon = base(S(a, 2));
+        uint32 page = U(a, 3), per = 30;
+        std::set<uint32> good;
+        for (uint32 i = 0; i < sItemDisplayInfoStore.GetNumRows(); ++i)
+            if (ItemDisplayInfoEntry const* e = sItemDisplayInfoStore.LookupEntry(i))
+                if (e->inventoryIcon && base(e->inventoryIcon) == icon)
+                    good.insert(e->ID);
+        std::map<uint32, ItemTemplate const*> byLook;
+        for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+            if (good.count(it.DisplayInfoID))
+            {
+                auto f = byLook.find(it.DisplayInfoID);
+                if (f == byLook.end() || it.ItemId < f->second->ItemId)
+                    byLook[it.DisplayInfoID] = &it;
+            }
+        std::vector<ItemTemplate const*> hits;
+        for (auto const& [d, it] : byLook)
+            hits.push_back(it);
+        std::sort(hits.begin(), hits.end(), [](ItemTemplate const* x, ItemTemplate const* y) { return x->Name1 != y->Name1 ? x->Name1 < y->Name1 : x->ItemId < y->ItemId; });
+        uint32 total = uint32(hits.size()), pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("IB", total, page, pages));
+        for (uint32 i = page * per; i < std::min(total, (page + 1) * per); ++i)
+            Send(p, Join("IR", hits[i]->ItemId, Clean(hits[i]->Name1, 60), hits[i]->Quality, hits[i]->DisplayInfoID, hits[i]->InventoryType));
+        Send(p, Join("IE", total, page, pages));
+    }
+
+    // MORSTEP~id~dir : the next (or previous) display id that exists, and morph into it
+    void OpMorphStep(Player* p, std::vector<std::string> const& a)
+    {
+        int64 id = int64(U(a, 2)), dir = S(a, 3) == "-1" ? -1 : 1, last = int64(sCreatureDisplayInfoStore.GetNumRows());
+        for (int64 n = 0; n < last; ++n)
+        {
+            id += dir;
+            if (id < 1) id = last - 1;
+            if (id >= last) id = 1;
+            if (sCreatureDisplayInfoStore.LookupEntry(uint32(id)))
+                break;
+        }
+        std::vector<std::string> b = { "Q", "MORPH", std::to_string(id) };
+        OpMorph(p, b);
+    }
+
+    // time of day for everyone online (a client re-syncs when it logs in)
+    void SetTimeOfDay(uint32 hour, uint32 minute, float speed)
+    {
+        time_t now = time(nullptr);
+        tm lt = *localtime(&now);
+        lt.tm_hour = int(hour % 24); lt.tm_min = int(minute % 60); lt.tm_sec = 0;
+        time_t t = mktime(&lt);
+        WorldPacket data(SMSG_LOGIN_SETTIMESPEED, 12);
+        data.AppendPackedTime(t);
+        data << float(speed);
+        data << uint32(0);
+        for (auto const& [id, session] : sWorldSessionMgr->GetAllSessions())
+            if (session->GetPlayer() && session->GetPlayer()->IsInWorld())
+                session->GetPlayer()->SendDirectMessage(&data);
+    }
+
+    // SRVTELE~text~page : places from the game_tele table
+    void OpTeleSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3), per = 14;
+        struct Row { uint32 id; std::string name; uint32 map; };
+        std::vector<Row> hits;
+        for (auto const& [id, t] : sObjectMgr->GetGameTeleMap())
+            if (q.empty() || Lower(t.name).find(q) != std::string::npos)
+                hits.push_back({ id, t.name, t.mapId });
+        std::sort(hits.begin(), hits.end(), [](Row const& x, Row const& y) { return x.name < y.name; });
+        uint32 total = uint32(hits.size()), pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("TLB", total, page, pages));
+        for (uint32 i = page * per; i < std::min(total, (page + 1) * per); ++i)
+            Send(p, Join("TLR", hits[i].id, Clean(hits[i].name, 50), hits[i].map));
+        Send(p, Join("TLE", total, page, pages));
+    }
+
+    // SRVEV~text~page : game events (holidays, seasonal things) with their on/off state
+    void OpEventSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Esc(S(a, 2));
+        uint32 page = U(a, 3), per = 14;
+        std::string from = " FROM game_event WHERE description LIKE '%" + q + "%'";
+        uint32 total = MaxOf("SELECT COUNT(*)" + from);
+        uint32 pages = std::max<uint32>(1, (total + per - 1) / per);
+        page = std::min(page, pages - 1);
+        Send(p, Join("EVB", total, page, pages));
+        if (QueryResult r = WorldDatabase.Query("{}", "SELECT eventEntry, description" + from + " ORDER BY eventEntry LIMIT " + std::to_string(per) + " OFFSET " + std::to_string(page * per)))
+            do
+            {
+                Field* f = r->Fetch();
+                uint32 id = f[0].Get<uint32>();
+                Send(p, Join("EVR", id, Clean(f[1].Get<std::string>(), 60), sGameEventMgr->IsActiveEvent(uint16(id)) ? 1 : 0));
+            } while (r->NextRow());
+        Send(p, Join("EVE", total, page, pages));
+    }
+
+    // SRV~what~arg... : world helpers
+    void OpServer(Player* p, std::vector<std::string> const& a)
+    {
+        std::string w = S(a, 2);
+        if (w == "time")
+        {
+            float speed = S(a, 5) == "0" ? 0.f : S(a, 5) == "10" ? 0.1666667f : 0.01666667f;
+            SetTimeOfDay(U(a, 3), U(a, 4), speed);
+            return Ok(p, "Time set for everyone online (a client re-syncs when it logs in)");
+        }
+        if (w == "weather")
+        {
+            RunCommand(p, ".wchange " + std::to_string(std::min<uint32>(U(a, 3), 3)) + " " + std::to_string(std::max(0.f, std::min(F(a, 4, 1.f), 1.f))));
+            return;
+        }
+        if (w == "tele")
+        {
+            auto const& m = sObjectMgr->GetGameTeleMap();
+            auto it = m.find(U(a, 3));
+            if (it == m.end())
+                return Err(p, "No such place");
+            p->TeleportTo(it->second.mapId, it->second.position_x, it->second.position_y, it->second.position_z, it->second.orientation);
+            return Ok(p, "Teleporting to " + Clean(it->second.name, 40));
+        }
+        if (w == "event")
+        {
+            std::string how = S(a, 3) == "stop" ? "stop" : "start";
+            RunCommand(p, ".event " + how + " " + std::to_string(U(a, 4)));
+            return;
+        }
+        if (w == "announce")
+        {
+            std::string t = Clean(S(a, 3), 200);
+            if (t.empty())
+                return Err(p, "Type the announcement first");
+            return RunCommand(p, ".announce " + t);
+        }
+        if (w == "saveall") { RunCommand(p, ".saveall"); return Ok(p, "All players saved"); }
+        if (w == "info")
+            return Send(p, Join("SI", uint32(sWorldSessionMgr->GetActiveSessionCount()), uint32(GameTime::GetUptime().count())));
+        if (w == "reload")
+        {
+            static std::set<std::string> const ok = { "creature_template", "gameobject_template", "npc_vendor", "smart_scripts", "gossip_menu", "game_tele",
+                "quest_template", "creature_text", "conditions", "loot_templates" };
+            std::string t = S(a, 3);
+            if (!ok.count(t))
+                return Err(p, "Not in the allowed list");
+            RunCommand(p, ".reload " + (t == "loot_templates" ? std::string("all_loot") : t));
+            return Ok(p, "Reloaded " + t);
+        }
+        if (w == "appear" || w == "summon")
+        {
+            std::string n = Clean(S(a, 3), 20);
+            n.erase(std::remove(n.begin(), n.end(), ' '), n.end());
+            if (n.empty())
+                return Err(p, "Type a player name first");
+            return RunCommand(p, "." + w + " " + n);
+        }
+        Err(p, "Unknown option");
+    }
+
     // ops that only read or only touch your recording: they never mark anything
     bool IsReadOnly(std::string const& op)
     {
         static std::set<std::string> const ro = { "HELLO", "SEARCH", "NEAR", "PPT", "PADD", "PUNDO", "PCLEAR", "PCLICK", "PADDAT", "PLIST", "BUF", "BUFC",
             "RGET", "RLOAD", "LGET", "NEWID", "QSEARCH", "GSEARCH", "ORACES", "ISEARCH", "DISGUISE", "UNDISGUISE", "OMINE", "OGET", "OPREV",
             "OPREVDEL", "XCSEARCH", "SPSEARCH", "GNEAR", "GTGT", "GPICK", "GSEL", "GGOTO", "SEL", "TGET", "CGET", "GOTO", "PSHOW", "PEDIT",
-            "RESPAWN", "PLAY", "SQLN", "SQLAREA", "SQLALL", "SQLEXP", "SQLCLR" };
+            "RESPAWN", "PLAY", "SQLN", "SQLAREA", "SQLALL", "SQLEXP", "SQLCLR", "ILIST", "IGET", "IGIVE", "ME", "MESETS", "ICONSEARCH", "REPSEARCH", "MORSEARCH", "MORPH", "MORSTEP", "SRV", "SRVTELE", "SRVEV" };
         return ro.count(op) != 0;
     }
 
@@ -2601,7 +3528,7 @@ namespace
         if (IsReadOnly(op))
             return DispatchOp(p, payload);
         static std::set<std::string> const globalOps = { "SPAWN", "DUP", "RENAMET", "RSET", "LADD", "LDEL", "QNEW", "QDEL", "QESCORT", "OSAVE",
-            "IPRICE", "VCUR", "GSPAWN", "GMOVE", "GNUDGE", "GNUDGEW", "GROT", "GFACE", "GDEL", "GDUP" };
+            "IPRICE", "VCUR", "GSPAWN", "GMOVE", "GNUDGE", "GNUDGEW", "GROT", "GFACE", "GDEL", "GDUP", "IMAKE", "IDEL" };
         Creature* c = nullptr;
         if (!globalOps.count(op))
         {
@@ -2672,6 +3599,21 @@ namespace
         if (op == "SPSEARCH") return OpSpellSearch(p, a);
         if (op == "GSPAWN") return OpGSpawn(p, a);
         if (op == "GNEAR") return OpGNear(p, a);
+        if (op == "IMAKE") return OpItemMake(p, a);
+        if (op == "IDEL") return OpItemDelete(p, a);
+        if (op == "ILIST") return OpItemList(p);
+        if (op == "IGET") return OpItemGet(p, a);
+        if (op == "IGIVE") return OpItemGive(p, a);
+        if (op == "ME") return OpMe(p, a);
+        if (op == "ICONSEARCH") return OpIconSearch(p, a);
+        if (op == "REPSEARCH") return OpRepSearch(p, a);
+        if (op == "MORSEARCH") return OpMorphSearch(p, a);
+        if (op == "MORPH") return OpMorph(p, a);
+        if (op == "MORSTEP") return OpMorphStep(p, a);
+        if (op == "SRV") return OpServer(p, a);
+        if (op == "SRVTELE") return OpTeleSearch(p, a);
+        if (op == "SRVEV") return OpEventSearch(p, a);
+        if (op == "MESETS") return OpMeSets(p, a);
         static std::set<std::string> const goOps = { "GTGT", "GPICK", "GSEL", "GMOVE", "GNUDGE", "GNUDGEW", "GROT", "GFACE", "GGOTO", "GDEL", "GDUP" };
         if (goOps.count(op)) return GoOps(p, op, a);
 
@@ -2717,7 +3659,9 @@ class CoADevMenuPlayerScript : public PlayerScript
 {
 public:
     CoADevMenuPlayerScript() : PlayerScript("CoADevMenuPlayerScript", { PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE, PLAYERHOOK_ON_LOGOUT,
-        PLAYERHOOK_ON_SAVE, PLAYERHOOK_ON_BEFORE_LOGOUT }) { }
+        PLAYERHOOK_ON_SAVE, PLAYERHOOK_ON_BEFORE_LOGOUT, PLAYERHOOK_ON_UPDATE }) { }
+
+    void OnPlayerUpdate(Player* player, uint32 diff) override { HeirloomTick(player, diff); }
 
     // never let a wardrobe disguise reach the database
     void OnPlayerSave(Player* player) override { if (Undisguise(player)) Send(player, Join("DG", 0)); }
@@ -2740,6 +3684,11 @@ public:
 
     void OnPlayerLogout(Player* player) override
     {
+        {
+            std::lock_guard<std::mutex> lock(g_heirLock);
+            g_heirApplied.erase(player->GetGUID().GetCounter());
+            g_heirTimer.erase(player->GetGUID().GetCounter());
+        }
         Undisguise(player);
         auto itr = g_state.find(player->GetGUID().GetCounter());
         if (itr == g_state.end())
@@ -2765,7 +3714,7 @@ class CoADevMenuWorldScript : public WorldScript
 public:
     CoADevMenuWorldScript() : WorldScript("CoADevMenuWorldScript", { WORLDHOOK_ON_STARTUP, WORLDHOOK_ON_UPDATE }) { }
 
-    void OnStartup() override { LoadOutfits(); }
+    void OnStartup() override { LoadOutfits(); LoadHeirlooms(); }
 
     // between map updates: safe to change templates, reload quests/vendors/gossip, spawn and move things
     void OnUpdate(uint32 /*diff*/) override

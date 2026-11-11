@@ -11,3 +11,6 @@ DevMenu_Create.lua
 DevMenu_Help.lua
 DevMenu_Share.lua
 DevMenu_Combat.lua
+DevMenu_Items.lua
+DevMenu_Me.lua
+DevMenu_Server.lua

@@ -955,14 +955,12 @@ do
     list.isSelected = function(d) return d == O.pick end
     list.onDouble = function(d) O.Preview(d) end
     local pager = Text(p, 10, C.dim); pager:SetPoint("TOPLEFT", 16, -464)
-    local prev = Button(p, "<", 26, 20, nil, function() if O.page > 0 then O.page = O.page - 1; O.Search() end end); prev:SetPoint("TOPLEFT", 236, -460)
-    local nxt = Button(p, ">", 26, 20, nil, function() if O.page + 1 < (O.pages or 1) then O.page = O.page + 1; O.Search() end end); nxt:SetPoint("LEFT", prev, "RIGHT", 4, 0)
     local bSpawn = Button(p, "Spawn selected here", 150, 26, "accent", function() if O.pick then O.Spawn(O.pick) end end); bSpawn:SetPoint("TOPLEFT", 16, -488)
     local bPrev = Button(p, "3D preview", 90, 26, nil, function() if O.pick then O.Preview(O.pick) end end); bPrev:SetPoint("LEFT", bSpawn, "RIGHT", 6, 0)
     local lh = Text(p, 10, C.dim); lh:SetPoint("TOPLEFT", 16, -520); lh:SetWidth(300)
     lh:SetText("Ctrl+click / double-click: 3D preview   Right-click: spawn at your feet. 'Every model' lists every object model of the game.")
     function O.Search()
-        if O.mode == 2 then Send("GNEAR", 60) else Send("GSEARCH", search:GetText(), O.page, O.mode) end
+        if O.mode == 2 then Send("GNEAR", 60) else list:Search(function(pg) Send("GSEARCH", search:GetText(), pg, O.mode) end) end
     end
     search:SetScript("OnEnterPressed", function(self) self:ClearFocus(); O.page = 0; if O.mode == 2 then mode:Set(0); O.mode = 0 end; O.Search() end)
     function O.Preview(d)
@@ -973,11 +971,11 @@ do
         if d.guid then return Send("GDUP", d.guid) end
         Send("GSPAWN", d.entry, d.entry == 0 and d.display or 0)
     end
-    H.GB = function(a) list.data = {}; O.pages = tonumber(a[4]) end
+    H.GB = function(a) list:Begin(a[4]) end
     H.GR = function(a) table.insert(list.data, { entry = tonumber(a[2]), name = a[3] or "", type = a[4], display = tonumber(a[5]), path = a[6] or "" }) end
     H.GE = function(a)
-        list.offset = 0; list:Refresh()
-        pager:SetText(("%s results   page %d / %s"):format(a[2], (tonumber(a[3]) or 0) + 1, a[4]))
+        list:Done()
+        pager:SetText(a[2] .. " results (scroll for more)")
     end
     H.GNB = function() list.data = {} end
     H.GN = function(a) table.insert(list.data, { guid = a[2], entry = tonumber(a[3]), name = a[4] or "", dist = a[5] }) end

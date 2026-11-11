@@ -247,17 +247,21 @@ local NAV = {
     { "quests", "Quests", "Interface\\Icons\\INV_Misc_Note_06" },
     { "objects", "Objects & assets", "Interface\\Icons\\INV_Crate_04" },
     { "create", "Create an NPC", "Interface\\Icons\\INV_Misc_Head_Human_01" },
+    { "items", "Create an item", "Interface\\Icons\\INV_Hammer_20" },
+    { "me", "Your character", "Interface\\Icons\\Achievement_Character_Human_Male" },
+    { "morph", "Morph", "Interface\\Icons\\Spell_Nature_Polymorph" },
+    { "server", "Server", "Interface\\Icons\\INV_Misc_Gear_01" },
     { "share", "Share as SQL", "Interface\\Icons\\INV_Scroll_03" },
     { "help", "Help", "Interface\\Icons\\INV_Misc_QuestionMark" },
 }
 for i, n in ipairs(NAV) do
     local key, label, tex = n[1], n[2], n[3]
-    local b = Button(nav, "", 154, 34, nil, function() ShowPage(key) end)
-    b:SetPoint("TOPLEFT", 8, -12 - (i - 1) * 40)
+    local b = Button(nav, "", 154, 30, nil, function() ShowPage(key) end)
+    b:SetPoint("TOPLEFT", 8, -8 - (i - 1) * 32)
     local ic = b:CreateTexture(nil, "OVERLAY")
     ic:SetTexture(tex)
     ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    ic:SetSize(22, 22)
+    ic:SetSize(20, 20)
     ic:SetPoint("LEFT", 8, 0)
     b.label:ClearAllPoints()
     b.label:SetPoint("LEFT", ic, "RIGHT", 8, 0)
@@ -302,7 +306,10 @@ local function MakeSlider(label, minV, maxV, step, get, set, y)
     local function show(x) v:SetText(math.floor(x * 100 + 0.5) .. "%") end
     show(get())
     t:SetText(label)
-    sl:SetScript("OnValueChanged", function(self, x) set(x); show(x); ApplyLook() end)
+    sl:SetScript("OnValueChanged", function(self, x) set(x); show(x); if not self.drag then ApplyLook() end end)
+    -- the window scales around the slider: apply the new size only when the mouse is released, or the slider jumps under the cursor
+    sl:HookScript("OnMouseDown", function(self) self.drag = true end)
+    sl:HookScript("OnMouseUp", function(self) self.drag = false; ApplyLook() end)
     sl:EnableMouseWheel(true)
     sl:SetScript("OnMouseWheel", function(self, d) self:SetValue(math.max(minV, math.min(maxV, self:GetValue() + d * step))) end)
     return sl
@@ -458,7 +465,7 @@ local function MakeList(parent, rows, rowH, columns, onClick)
         local r = CreateFrame("Button", nil, L)
         r:SetHeight(rowH)
         r:SetPoint("TOPLEFT", 1, -1 - (i - 1) * rowH)
-        r:SetPoint("TOPRIGHT", -1, -1 - (i - 1) * rowH)
+        r:SetPoint("TOPRIGHT", -12, -1 - (i - 1) * rowH)
         r.bg = r:CreateTexture(nil, "BACKGROUND")
         r.bg:SetAllPoints()
         r.bg:SetTexture(WHITE)
@@ -499,12 +506,39 @@ local function MakeList(parent, rows, rowH, columns, onClick)
         end)
         L.rows[i] = r
     end
+    -- scrollbar: a list that has more pages on the server loads them as you scroll down
+    local sb = CreateFrame("Slider", nil, L)
+    sb:SetOrientation("VERTICAL"); sb:SetWidth(8)
+    sb:SetPoint("TOPRIGHT", -2, -2); sb:SetPoint("BOTTOMRIGHT", -2, 2)
+    sb:SetThumbTexture(WHITE); sb:GetThumbTexture():SetVertexColor(unpack(C.accent)); sb:GetThumbTexture():SetSize(8, 22)
+    sb:SetMinMaxValues(0, 0); sb:SetValueStep(1)
+    sb:SetScript("OnValueChanged", function(self, v)
+        if L.syncing then return end
+        L.offset = math.floor(v + 0.5); L:Refresh()
+    end)
+    L.sb = sb
+    L.page = 0
+    function L:More()
+        if self.hasMore and not self.loading and self.fetch then
+            self.loading = true; self.page = self.page + 1; self.fetch(self.page)
+        end
+    end
+    function L:Search(fn) self.page = 0; self.fetch = fn; self.hasMore = false; self.loading = true; fn(0) end
+    function L:Begin(pages) if self.page == 0 then self.data = {}; self.offset = 0 end; self.pages = tonumber(pages) or 1 end
+    function L:Done() self.loading = false; self.hasMore = self.page + 1 < (self.pages or 1); self:Refresh() end
     L:EnableMouseWheel(true)
     L:SetScript("OnMouseWheel", function(self, d)
         self.offset = math.max(0, math.min(#self.data - rows, self.offset - d * 3))
         self:Refresh()
     end)
     function L:Refresh()
+        local maxOff = math.max(0, #self.data - rows)
+        if self.offset > maxOff then self.offset = maxOff end
+        self.syncing = true
+        sb:SetMinMaxValues(0, maxOff); sb:SetValue(self.offset)
+        self.syncing = false
+        Shown(sb, maxOff > 0)
+        if self.hasMore and self.offset + rows >= #self.data - 3 then self:More() end
         for i, r in ipairs(self.rows) do
             local d = self.data[self.offset + i]
             if d then
@@ -533,11 +567,10 @@ do
     local search = Edit(p, 420, 28, false)
     search:SetPoint("TOPLEFT", 16, -40)
     search:SetPlaceholder("Name, title or entry id  (Enter to search)")
-    local filter, page = 0, 0
-    local function DoSearch(pg)
-        page = pg or 0
-        Send("SEARCH", search:GetText(), page, filter)
-        Toast("Searching...")
+    local filter = 0
+    local list
+    local function DoSearch()
+        list:Search(function(pg) Send("SEARCH", search:GetText(), pg, filter) end)
     end
     search:SetScript("OnEnterPressed", function(self) self:ClearFocus(); DoSearch(0) end)
     local go = Button(p, "Search", 90, 28, "accent", function() DoSearch(0) end)
@@ -559,7 +592,7 @@ do
     end
     chips[1]:SetActive(true)
 
-    local list = MakeList(p, 11, 24, {
+    list = MakeList(p, 11, 24, {
         { w = 330 }, { w = 70, color = C.dim, size = 11 }, { w = 70, color = C.dim, size = 11, right = true }, { w = 80, color = C.dim, size = 11 },
     }, function(d, btn, ctrl)
         if btn == "RightButton" then S.pick = d; p.list:Refresh(); p:ShowPick(); return ShowMenu(d) end
@@ -579,18 +612,6 @@ do
     list.isSelected = function(d) return S.pick and S.pick.entry == d.entry end
     list.onDouble = function(d) Preview(d.entry, d.name, d.sub) end
     p.list = list
-
-    local pager = CreateFrame("Frame", nil, p)
-    pager:SetSize(300, 24)
-    pager:SetPoint("TOPRIGHT", list, "BOTTOMRIGHT", 0, -6)
-    local prev = Button(pager, "< Prev", 70, 22, nil, function() if page > 0 then DoSearch(page - 1) end end)
-    prev:SetPoint("LEFT")
-    local pageText = Text(pager, 11, C.dim)
-    pageText:SetPoint("LEFT", prev, "RIGHT", 10, 0)
-    pageText:SetWidth(120)
-    pageText:SetJustifyH("CENTER")
-    local nextB = Button(pager, "Next >", 70, 22, nil, function() if page + 1 < (S.pages or 1) then DoSearch(page + 1) end end)
-    nextB:SetPoint("LEFT", pageText, "RIGHT", 10, 0)
 
     -- action card for the picked entry
     local card = Card(p)
@@ -635,14 +656,8 @@ do
     p:ShowPick()
 
     function p:OnResults()
-        list.data = S.results
-        list.offset = 0
-        list:Refresh()
-        countText:SetText((S.total or 0) .. " NPCs found")
-        pageText:SetText(("Page %d / %d"):format((S.page or 0) + 1, S.pages or 1))
-        prev:SetEnabledState((S.page or 0) > 0)
-        nextB:SetEnabledState((S.page or 0) + 1 < (S.pages or 1))
-        Toast(("%d results"):format(S.total or 0), "ok")
+        list:Done()
+        countText:SetText((S.total or 0) .. " NPCs found (scroll for more)")
     end
     function p:OnShowPage() if #S.results == 0 then DoSearch(0) end end
 end
@@ -1520,7 +1535,7 @@ H.HI = function(a)
 end
 H.OK = function(a) Toast(a[2] or "Done", "ok") end
 H.ER = function(a) Toast(a[2] or "Error", "err") end
-H.SB = function(a) S.results = {}; S.total, S.page, S.pages = tonumber(a[2]), tonumber(a[3]), tonumber(a[4]) end
+H.SB = function(a) S.total = tonumber(a[2]); pages.browse.list:Begin(a[4]); S.results = pages.browse.list.data end
 H.SR = function(a)
     table.insert(S.results, { entry = a[2], name = a[3] or "", sub = a[4] or "", minl = a[5], maxl = a[6], react = a[7], npcflag = a[8], rank = a[9], type = a[10], display = a[11] or "0" })
 end
