@@ -34,6 +34,7 @@ local ACTIONS = {
     { "Reveal the whole map", { "explore" }, "Marks every zone as explored." },
     { "Learn my class spells", { "learn", "class" }, "Every trainer spell, talent and class quest spell for your class." },
     { "Learn all mounts", { "learn", "mounts" }, "Every mount your server has an item for." },
+    { "Learn all pets", { "learn", "pets" }, "Every companion pet your server has an item for." },
     { "Max my skills", { "learn", "skills" }, "Weapon and profession skills to the maximum for your level." },
     { "Learn languages", { "learn", "lang" } },
 }

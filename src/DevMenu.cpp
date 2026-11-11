@@ -3096,6 +3096,26 @@ namespace
         Ok(p, "Learned " + std::to_string(learned) + " mounts");
     }
 
+    void LearnAllPets(Player* p)
+    {
+        uint32 learned = 0;
+        for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+        {
+            if (it.Class != ITEM_CLASS_MISC || it.SubClass != 2 || !it.Spells[0].SpellId)   // 2 = companion pets
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(it.Spells[0].SpellId);
+            if (!si)
+                continue;
+            for (SpellEffectInfo const& e : si->Effects)
+                if (e.Effect == SPELL_EFFECT_LEARN_SPELL && e.TriggerSpell && !p->HasSpell(e.TriggerSpell) && sSpellMgr->GetSpellInfo(e.TriggerSpell))
+                {
+                    p->learnSpell(e.TriggerSpell);
+                    ++learned;
+                }
+        }
+        Ok(p, "Learned " + std::to_string(learned) + " pets");
+    }
+
     // REPSEARCH~text~page : factions with your standing
     void OpRepSearch(Player* p, std::vector<std::string> const& a)
     {
@@ -3174,6 +3194,7 @@ namespace
             else if (k == "lang") RunCommand(p, ".learn all lang");
             else if (k == "skills") { p->UpdateSkillsToMaxSkillsForLevel(); Ok(p, "Skills raised to the maximum"); }
             else if (k == "mounts") LearnAllMounts(p);
+            else if (k == "pets") LearnAllPets(p);
             else return Err(p, "Unknown learn option");
         }
         else if (w == "explore")
