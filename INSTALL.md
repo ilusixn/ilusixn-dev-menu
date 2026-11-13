@@ -15,7 +15,7 @@ Dev Menu has two parts:
 ## 1. Add the server module
 
 **Option A, from the release zip:**
-1. Download `mod-ilusixn-devmenu-v1.2.zip` from the [Releases page](https://github.com/ilusixn/ilusixn-dev-menu/releases).
+1. Download `mod-ilusixn-devmenu-v1.3.zip` from the [Releases page](https://github.com/ilusixn/ilusixn-dev-menu/releases).
 2. Unzip it into the `modules` folder of your AzerothCore **source** (the folder that already holds `mod-eluna`, `mod-playerbots`, etc. if you use any), so you get `azerothcore/modules/mod-ilusixn-devmenu/src/DevMenu.cpp`.
 
 **Option B, with git** (from your AzerothCore folder):
@@ -47,7 +47,7 @@ On first start the module creates its tables in the world database (`coa_npc_out
 
 ## 5. Install the addon (each GM)
 
-1. Download `DevMenu-addon-v1.2.zip` (or take `client/DevMenu` from the repo).
+1. Download `DevMenu-addon-v1.3.zip` (or take `client/DevMenu` from the repo).
 2. Unzip it into `World of Warcraft/Interface/AddOns/` so you get `Interface/AddOns/DevMenu/DevMenu.toc`.
 3. Restart the game (not just `/reload`, since the addon is new) and enable it on the character screen's AddOns list if needed.
 4. Log in on a GM account and type **`/dev`**.
