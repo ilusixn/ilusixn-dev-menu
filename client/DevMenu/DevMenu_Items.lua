@@ -284,16 +284,16 @@ local function SlotIndex()
     end
     return 14
 end
+local iconMode   -- an icon name while the list shows items that use that icon
 local list = MakeList(p, 8, 22, { { w = 150 }, { w = 40, color = C.dim, right = true } }, function(d)
     lookItem = d.id; dispE:SetText(tostring(d.disp)); lookName:SetText(d.name)
-    lookIcon:SetTexture(IconOf(d.id) or "Interface\\Icons\\INV_Misc_QuestionMark")
+    lookIcon:SetTexture(iconMode and ("Interface\\Icons\\" .. iconMode) or IconOf(d.id) or "Interface\\Icons\\INV_Misc_QuestionMark")
     Fetch(d.id); DressLook()
 end)
 list:SetPoint("TOPLEFT", 372 + 70, -312); list:SetSize(250, 180)
 list.format = function(d) return { d.name, tostring(d.id):sub(1, 6) } end
 RowIcons(list, function(d) return d.id end, -4)
 list.data = {}
-local iconMode   -- an icon name while the list shows items that use that icon
 local waiting = false
 local function Run()
     list:Search(function(pg)
@@ -516,6 +516,20 @@ local function LoadIcons()
         for _, n in ipairs(t) do Add(n) end
     end
 end
+-- only icons that some item look uses can be applied: the server lists them, we keep the matching ones
+local usable, usableDone
+local function Filter()
+    if not usable or not usableDone then return end
+    local keep = {}
+    for _, n in ipairs(icons) do if usable[n:lower()] then keep[#keep + 1] = n end end
+    if #keep > 0 then icons = keep end
+end
+H.ICU = function(a)
+    usable = usable or {}
+    for n in (a[4] or ""):gmatch("[^,]+") do usable[n] = true end
+    local pg, pages = tonumber(a[2]) or 0, tonumber(a[3]) or 1
+    if pg + 1 < pages then Send("ICONUSE", pg + 1) else usableDone = true; Filter(); if icp:IsShown() then icp:GetScript("OnShow")() end end
+end
 local COLS, ROWS, CELL = 14, 9, 44
 local icOff, icCells = 0, {}
 local icSlider
@@ -552,10 +566,12 @@ icSlider:SetScript("OnValueChanged", function(self, v) icOff = math.floor(v + 0.
 icp:EnableMouseWheel(true)
 icp:SetScript("OnMouseWheel", function(self, d) icSlider:SetValue(math.max(0, math.min(select(2, icSlider:GetMinMaxValues()), icOff - d * 2))) end)
 local icNote = Text(icp, 10, C.dim); icNote:SetPoint("TOPLEFT", 14, -454); icNote:SetWidth(660); icNote:SetJustifyH("LEFT")
-icNote:SetText("Click an icon: the list then shows the items that use it. Pick one and your new item gets that look and icon. A completely free icon needs a client data patch, because the game takes the icon from the item's look.")
+icNote:SetText("Click an icon: the list then shows the items that use it. Pick one and your new item gets that look and icon. Only icons that an item look can carry are shown (the game takes the icon from the item's look).")
 local icX = Button(icp, "Close", 80, 24, nil, function() icp:Hide() end); icX:SetPoint("BOTTOMRIGHT", -12, 12)
 icp:SetScript("OnShow", function()
     LoadIcons()
+    if not usableDone and not usable then Send("ICONUSE", 0) end
+    Filter()
     icSlider:SetMinMaxValues(0, math.max(0, math.ceil(#icons / COLS) - ROWS)); icSlider:SetValue(0); icOff = 0; IcRefresh()
 end)
 local icB = Button(p, "Customise icon", 250, 22, nil, function() icp:Show() end)

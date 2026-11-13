@@ -16,6 +16,8 @@
 #include "DBCStores.h"
 #include "GameEventMgr.h"
 #include "GameTime.h"
+#include "Guild.h"
+#include "GuildMgr.h"
 #include "WorldSessionMgr.h"
 #include "ReputationMgr.h"
 #include "GridNotifiers.h"
@@ -42,6 +44,7 @@
 #include <G3D/Matrix3.h>
 #include <set>
 #include <mutex>
+#include <thread>
 #include "WorldScript.h"
 #include "ServerScript.h"
 #include "Opcodes.h"
@@ -254,9 +257,7 @@ namespace
             return 0;
 
         uint32 entry = CLONE_FIRST;
-        if (QueryResult r = WorldDatabase.Query("SELECT MAX(entry) FROM creature_template WHERE entry BETWEEN {} AND {}", CLONE_FIRST, CLONE_LAST))
-            if (!r->Fetch()[0].IsNull())
-                entry = r->Fetch()[0].Get<uint32>() + 1;
+        // first free id from the bottom: other tools park entries at the top of the range, so "MAX + 1" ran out while 25 ids were used
         while (entry <= CLONE_LAST && sObjectMgr->GetCreatureTemplate(entry))
             ++entry;
         if (entry > CLONE_LAST)
@@ -2646,13 +2647,13 @@ namespace
         float f = float(v);
         switch (t)
         {
-            case 0: p->HandleStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, f, apply); break;
-            case 1: p->HandleStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, f, apply); break;
-            case 3: p->HandleStatFlatModifier(UNIT_MOD_STAT_AGILITY, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_AGILITY); break;
-            case 4: p->HandleStatFlatModifier(UNIT_MOD_STAT_STRENGTH, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STRENGTH); break;
-            case 5: p->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_INTELLECT); break;
-            case 6: p->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_SPIRIT); break;
-            case 7: p->HandleStatFlatModifier(UNIT_MOD_STAT_STAMINA, BASE_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STAMINA); break;
+            case 0: p->HandleStatFlatModifier(UNIT_MOD_MANA, TOTAL_VALUE, f, apply); break;
+            case 1: p->HandleStatFlatModifier(UNIT_MOD_HEALTH, TOTAL_VALUE, f, apply); break;
+            case 3: p->HandleStatFlatModifier(UNIT_MOD_STAT_AGILITY, TOTAL_VALUE, f, apply); p->UpdateStatBuffMod(STAT_AGILITY); break;
+            case 4: p->HandleStatFlatModifier(UNIT_MOD_STAT_STRENGTH, TOTAL_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STRENGTH); break;
+            case 5: p->HandleStatFlatModifier(UNIT_MOD_STAT_INTELLECT, TOTAL_VALUE, f, apply); p->UpdateStatBuffMod(STAT_INTELLECT); break;
+            case 6: p->HandleStatFlatModifier(UNIT_MOD_STAT_SPIRIT, TOTAL_VALUE, f, apply); p->UpdateStatBuffMod(STAT_SPIRIT); break;
+            case 7: p->HandleStatFlatModifier(UNIT_MOD_STAT_STAMINA, TOTAL_VALUE, f, apply); p->UpdateStatBuffMod(STAT_STAMINA); break;
             case 12: p->ApplyRatingMod(CR_DEFENSE_SKILL, v, apply); break;
             case 13: p->ApplyRatingMod(CR_DODGE, v, apply); break;
             case 14: p->ApplyRatingMod(CR_PARRY, v, apply); break;
@@ -2672,7 +2673,8 @@ namespace
         }
     }
 
-    // what the equipped heirlooms add at the player's level; re-applied only when it changes
+    // what the equipped heirlooms add at the player's level; re-applied only when it changes.
+    // The bonus goes in TOTAL_VALUE: BASE_VALUE is reset by the core on every level up, which cut the bonus to new minus old.
     void RefreshHeirlooms(Player* p)
     {
         std::vector<std::pair<uint32, int32>> want, old;
@@ -2822,7 +2824,6 @@ namespace
             sql << ", " << stT[i] << ", " << stV[i];
         sql << ")";
         WorldDatabase.DirectExecute("{}", sql.str());
-
         // the in-memory template, in place (existing copies of the item see it at once)
         auto& store = const_cast<ItemTemplateContainer&>(*sObjectMgr->GetItemTemplateStore());
         ItemTemplate& t = store[id];
@@ -3069,51 +3070,42 @@ namespace
         Ok(p, what + ": " + std::to_string(given) + " items added");
     }
 
-    void LearnAllMounts(Player* p)
+    // every item of class Misc / subclass `sub` (5 mounts, 2 companions): look at all five spell slots, since generated
+    // retail items carry the mount / summon spell directly (slot 2) while stock items go through a learn effect (slot 1)
+    uint32 LearnCollectibles(Player* p, uint32 sub)
     {
         uint32 learned = 0;
         for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
         {
-            if (it.Class != ITEM_CLASS_MISC || it.SubClass != 5 || !it.Spells[0].SpellId)
+            if (it.Class != ITEM_CLASS_MISC || it.SubClass != sub)
                 continue;
-            SpellInfo const* si = sSpellMgr->GetSpellInfo(it.Spells[0].SpellId);
-            if (!si)
-                continue;
-            uint32 mountSpell = 0;
-            for (SpellEffectInfo const& e : si->Effects)
+            for (auto const& sp : it.Spells)
             {
-                if (e.Effect == SPELL_EFFECT_LEARN_SPELL && e.TriggerSpell)
-                    mountSpell = e.TriggerSpell;
-                else if (e.Effect == SPELL_EFFECT_APPLY_AURA && e.ApplyAuraName == SPELL_AURA_MOUNTED)
-                    mountSpell = si->Id;
-            }
-            if (mountSpell && !p->HasSpell(mountSpell) && sSpellMgr->GetSpellInfo(mountSpell))
-            {
-                p->learnSpell(mountSpell);
-                ++learned;
-            }
-        }
-        Ok(p, "Learned " + std::to_string(learned) + " mounts");
-    }
-
-    void LearnAllPets(Player* p)
-    {
-        uint32 learned = 0;
-        for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
-        {
-            if (it.Class != ITEM_CLASS_MISC || it.SubClass != 2 || !it.Spells[0].SpellId)   // 2 = companion pets
-                continue;
-            SpellInfo const* si = sSpellMgr->GetSpellInfo(it.Spells[0].SpellId);
-            if (!si)
-                continue;
-            for (SpellEffectInfo const& e : si->Effects)
-                if (e.Effect == SPELL_EFFECT_LEARN_SPELL && e.TriggerSpell && !p->HasSpell(e.TriggerSpell) && sSpellMgr->GetSpellInfo(e.TriggerSpell))
+                SpellInfo const* si = sp.SpellId > 0 ? sSpellMgr->GetSpellInfo(sp.SpellId) : nullptr;
+                if (!si)
+                    continue;
+                uint32 learn = 0;
+                for (SpellEffectInfo const& e : si->Effects)
                 {
-                    p->learnSpell(e.TriggerSpell);
+                    if (e.Effect == SPELL_EFFECT_LEARN_SPELL && e.TriggerSpell)
+                        learn = e.TriggerSpell;
+                    else if (!learn && ((e.Effect == SPELL_EFFECT_APPLY_AURA && e.ApplyAuraName == SPELL_AURA_MOUNTED) || (sub == 2 && e.Effect == SPELL_EFFECT_SUMMON)))
+                        learn = si->Id;
+                }
+                if (learn && !p->HasSpell(learn) && sSpellMgr->GetSpellInfo(learn))
+                {
+                    p->learnSpell(learn);
                     ++learned;
                 }
+            }
         }
-        Ok(p, "Learned " + std::to_string(learned) + " pets");
+        return learned;
+    }
+
+    void LearnAllMounts(Player* p)
+    {
+        uint32 m = LearnCollectibles(p, 5), c = LearnCollectibles(p, 2);
+        Ok(p, "Learned " + std::to_string(m) + " mounts and " + std::to_string(c) + " pets");
     }
 
     // REPSEARCH~text~page : factions with your standing
@@ -3142,6 +3134,8 @@ namespace
             Send(p, Join("RPR", hits[i].id, Clean(hits[i].name, 50), hits[i].st));
         Send(p, Join("RPE", total, page, pages));
     }
+
+    void CreateMyGuild(Player* p, std::string name);
 
     // ME~what~arg... : one-click GM helpers on your own character
     void OpMe(Player* p, std::vector<std::string> const& a)
@@ -3194,9 +3188,10 @@ namespace
             else if (k == "lang") RunCommand(p, ".learn all lang");
             else if (k == "skills") { p->UpdateSkillsToMaxSkillsForLevel(); Ok(p, "Skills raised to the maximum"); }
             else if (k == "mounts") LearnAllMounts(p);
-            else if (k == "pets") LearnAllPets(p);
+            else if (k == "pets") LearnAllMounts(p);
             else return Err(p, "Unknown learn option");
         }
+        else if (w == "guild") CreateMyGuild(p, S(a, 3));
         else if (w == "explore")
         {
             for (uint32 i = 0; i < PLAYER_EXPLORED_ZONES_SIZE; ++i)
@@ -3326,6 +3321,61 @@ namespace
     }
 
     // ICONSEARCH~icon~page : items (one per look) whose inventory icon is that texture; answers like ISEARCH
+    // ME~guild~name : makes a guild of that name with you as its leader (for characters that have none)
+    void CreateMyGuild(Player* p, std::string name)
+    {
+        std::string clean;
+        for (char ch : name)
+            if (std::isalpha(uint8(ch)) || ch == ' ')
+                clean += ch;
+        while (!clean.empty() && clean.back() == ' ')
+            clean.pop_back();
+        if (p->GetGuild())
+            return Err(p, "You are already in the guild " + p->GetGuild()->GetName());
+        if (clean.size() < 2 || clean.size() > 24)
+            return Err(p, "Guild names are 2 to 24 letters");
+        if (sGuildMgr->GetGuildByName(clean))
+            return Err(p, "A guild called " + clean + " already exists");
+        Guild* g = new Guild();
+        if (!g->Create(p, clean))
+        {
+            delete g;
+            return Err(p, "Could not create the guild");
+        }
+        sGuildMgr->AddGuild(g);
+        Ok(p, "Guild '" + clean + "' created, you lead it");
+    }
+
+    // ICONUSE~page : the icons (lower-case file names) that at least one item look uses, 12 per message. The icon window
+    // shows only these: any other icon could not be applied to a new item (the game takes the icon from the item's look)
+    void OpIconUse(Player* p, std::vector<std::string> const& a)
+    {
+        static std::vector<std::string> names;
+        uint32 page = U(a, 2), per = 12;
+        if (!page || names.empty())
+        {
+            std::set<uint32> looks;
+            for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+                if (it.DisplayInfoID)
+                    looks.insert(it.DisplayInfoID);
+            std::set<std::string> out;
+            for (uint32 d : looks)
+                if (ItemDisplayInfoEntry const* e = sItemDisplayInfoStore.LookupEntry(d))
+                    if (e->inventoryIcon && *e->inventoryIcon)
+                    {
+                        std::string n = Lower(e->inventoryIcon);
+                        size_t c = n.find_last_of("\\/");
+                        out.insert(c == std::string::npos ? n : n.substr(c + 1));
+                    }
+            names.assign(out.begin(), out.end());
+        }
+        uint32 pages = std::max<uint32>(1, (uint32(names.size()) + per - 1) / per);
+        std::string row;
+        for (uint32 i = page * per; i < std::min<uint32>(uint32(names.size()), (page + 1) * per); ++i)
+            row += (row.empty() ? "" : ",") + names[i];
+        Send(p, Join("ICU", page, pages, row));
+    }
+
     void OpIconSearch(Player* p, std::vector<std::string> const& a)
     {
         auto base = [](std::string s)
@@ -3627,6 +3677,7 @@ namespace
         if (op == "IGIVE") return OpItemGive(p, a);
         if (op == "ME") return OpMe(p, a);
         if (op == "ICONSEARCH") return OpIconSearch(p, a);
+        if (op == "ICONUSE") return OpIconUse(p, a);
         if (op == "REPSEARCH") return OpRepSearch(p, a);
         if (op == "MORSEARCH") return OpMorphSearch(p, a);
         if (op == "MORPH") return OpMorph(p, a);

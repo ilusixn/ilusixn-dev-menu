@@ -10,13 +10,53 @@ local p = pages.create
 -- addons may not target by code, but a secure button clicked by you may: slot clicks also target the preview NPC,
 -- so the wardrobe can draw the race you are making (it draws your target)
 local TARGET_PREVIEW = "/targetexact Preview" .. string.char(10) .. "/targetexact Dev outfit preview"
+-- A secure frame makes every parent "protected": the whole menu could not be shown or hidden in combat. So the secure buttons live
+-- on UIParent, are anchored to the page they belong to, and a small driver keeps them shown, scaled and faded like that page.
+local secureSlots = {}
 local function SecureSlot(parent)
-    local b = CreateFrame("Button", nil, parent, "SecureActionButtonTemplate")
+    local b = CreateFrame("Button", nil, UIParent, "SecureActionButtonTemplate")
     b:SetAttribute("type", "macro")
     b:SetAttribute("macrotext", TARGET_PREVIEW)
     b:RegisterForClicks("LeftButtonUp")
+    b.owner = parent
+    b.rawPoint = b.SetPoint
+    -- no anchor to the menu either (a frame anchored to a secure one is restricted in combat): the driver places it by hand
+    b.SetPoint = function(self, point, x, y)
+        self.dx, self.dy = x or 0, y or 0
+    end
+    b:Hide()
+    secureSlots[#secureSlots + 1] = b
     return b
 end
+local slotDriver = CreateFrame("Frame")
+slotDriver:SetScript("OnUpdate", function(self, el)
+    self.t = (self.t or 0) + el
+    if self.t < 0.05 then return end
+    self.t = 0
+    local safe = not InCombatLockdown()
+    for _, b in ipairs(secureSlots) do
+        local o = b.owner
+        local on = o:IsVisible()
+        b:SetAlpha(on and o:GetEffectiveAlpha() or 0)   -- allowed in combat: a button that cannot hide stays invisible
+        if safe then
+            if on then
+                local sc, l, t = o:GetEffectiveScale() / UIParent:GetEffectiveScale(), o:GetLeft(), o:GetTop()
+                -- only touch layout when something moved: re-anchoring every tick made the game stall
+                -- (a page reload may clear the button's anchor or change its offset: GetNumPoints / dx / dy catch that)
+                if l and t and (b.cl ~= l or b.ct ~= t or b.cs ~= sc or b.cdx ~= b.dx or b.cdy ~= b.dy or b:GetNumPoints() == 0) then
+                    b.cl, b.ct, b.cs, b.cdx, b.cdy = l, t, sc, b.dx, b.dy
+                    b:SetFrameStrata(o:GetFrameStrata()); b:SetFrameLevel(o:GetFrameLevel() + 4)
+                    b:SetScale(sc)
+                    b:ClearAllPoints()
+                    b.rawPoint(b, "TOPLEFT", UIParent, "BOTTOMLEFT", l + (b.dx or 0), t + (b.dy or 0))
+                end
+                if not b:IsShown() then b:Show() end
+            elseif b:IsShown() then
+                b:Hide()
+            end
+        end
+    end
+end)
 
 -- 3.3.5 only asks the server about an item when a tooltip shows it: use a hidden tooltip, then poll the cache
 local scan = CreateFrame("GameTooltip", "CoADevItemScan", UIParent, "GameTooltipTemplate")

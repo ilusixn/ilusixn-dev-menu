@@ -27,20 +27,29 @@ end
 
 -- ------------------------------------------------------------------ quick actions
 Header(p, "Quick actions"):SetPoint("TOPLEFT", 16, -150)
+StaticPopupDialogs["COADEV_GUILD"] = {
+    text = "Name of your new guild (2 to 24 letters):", button1 = ACCEPT, button2 = CANCEL, hasEditBox = 1, maxLetters = 24,
+    OnAccept = function(self) Send("ME", "guild", self.editBox:GetText()) end,
+    EditBoxOnEnterPressed = function(self) Send("ME", "guild", self:GetText()); self:GetParent():Hide() end,
+    EditBoxOnEscapePressed = function(self) self:GetParent():Hide() end,
+    timeout = 0, whileDead = 1, hideOnEscape = 1,
+}
 local ACTIONS = {
     { "Full heal / revive", { "heal" }, "Revives you if dead and refills health and mana." },
     { "Clear cooldowns", { "cooldowns" } },
     { "Repair everything", { "repair" } },
     { "Reveal the whole map", { "explore" }, "Marks every zone as explored." },
     { "Learn my class spells", { "learn", "class" }, "Every trainer spell, talent and class quest spell for your class." },
-    { "Learn all mounts", { "learn", "mounts" }, "Every mount your server has an item for." },
-    { "Learn all pets", { "learn", "pets" }, "Every companion pet your server has an item for." },
+    { "Learn all mounts & pets", { "learn", "mounts" }, "Every mount and every companion pet your server has an item for." },
     { "Max my skills", { "learn", "skills" }, "Weapon and profession skills to the maximum for your level." },
-    { "Learn languages", { "learn", "lang" } },
+    { "Create my guild...", { "guild" }, "Makes a guild with the name you choose and puts you in it as its leader. Only if you have no guild yet." },
 }
 for i, a in ipairs(ACTIONS) do
     local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
-    local b = Button(p, a[1], 164, 26, nil, function() Send("ME", unpack(a[2])) end)
+    local b = Button(p, a[1], 164, 26, nil, function()
+        if a[2][1] == "guild" then StaticPopup_Show("COADEV_GUILD") return end
+        Send("ME", unpack(a[2])); if a[4] then Send("ME", unpack(a[4])) end
+    end)
     b:SetPoint("TOPLEFT", 16 + col * 170, -176 - row * 30)
     if a[3] then Tip(b, a[1], a[3]) end
 end

@@ -59,7 +59,7 @@ It's a plain module: no core patches and no SQL to import. It creates its own ta
   - **Path map:** its own resizable window. Zoom with the wheel, drag to pan, pick a point and *Go to* (teleport), *Move here*, *Insert after* or *Delete*. Every path button is also under the map.
   - **Saved paths:** keep routes by name and load them on any NPC later.
 - **Create an item:** build an item from A to Z (armor, weapon, consumable, other): name, quality, item level, required level, stats, prices, a spell (searchable by name), a description, a look and an icon from a picker. Heirlooms are supported: choose how much each stat grows per level. *Items created* lists everything you made with a Give button and favourites.
-- **Your character:** powers (god mode, flying, instant cast, no cooldowns...), level, money, honor and arena points, all mounts, heirloom sets, gear sets with a level filter, bag presets that fill any character's bags in one click, every reputation, and Alliance / Neutral / Horde.
+- **Your character:** powers (god mode, flying, instant cast, no cooldowns...), level, money, honor and arena points, all mounts and pets in one button, create your own guild, heirloom sets, gear sets with a level filter, bag presets that fill any character's bags in one click, every reputation, and Alliance / Neutral / Horde.
 - **Morph:** morph into any model id with a live preview (reverts unless you press Apply), and walk through every model id.
 - **Server:** time of day, weather, teleport places, holiday events, announcements, save all players, reload tables.
 - Long lists (NPCs, objects, gear sets, models, places) scroll like normal lists and load more as you scroll.
