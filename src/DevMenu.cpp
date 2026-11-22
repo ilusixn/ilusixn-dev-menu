@@ -75,6 +75,8 @@ namespace
     std::unordered_map<ObjectGuid::LowType, EditState> g_state;
     std::vector<std::pair<ObjectGuid, std::string>> g_queue;   // requests waiting for the world thread
     std::mutex g_queueLock;
+    std::vector<std::pair<ObjectGuid, std::string>> g_patchDone;   // item patch results ("!" = failed), under g_queueLock
+    std::atomic<bool> g_patchBusy{ false };
 
     void RefreshLook(Creature* c);
 
@@ -2258,13 +2260,16 @@ namespace
         Send(p, Join("DG", 1));
     }
 
-    // ISEARCH~text~slot~page : items that fit an outfit slot (slot index as in the outfit, 11-13 = weapons)
+    // InventoryTypes that fit an outfit slot (slot index as in the outfit, 11-13 = weapons, 14 = anything)
+    std::vector<std::set<uint32>> const SLOT_TYPES = {
+        { 1 }, { 3 }, { 4 }, { 5, 20 }, { 6 }, { 7 }, { 8 }, { 9 }, { 10 }, { 16 }, { 19 },
+        { 13, 17, 21 }, { 13, 14, 22, 23 }, { 15, 25, 26 }, {},
+    };
+
+    // ISEARCH~text~slot~page : items that fit an outfit slot
     void OpItemSearch(Player* p, std::vector<std::string> const& a)
     {
-        static std::vector<std::set<uint32>> const types = {
-            { 1 }, { 3 }, { 4 }, { 5, 20 }, { 6 }, { 7 }, { 8 }, { 9 }, { 10 }, { 16 }, { 19 },
-            { 13, 17, 21 }, { 13, 14, 22, 23 }, { 15, 25, 26 }, {},
-        };
+        auto const& types = SLOT_TYPES;
         std::string q = Lower(S(a, 2));
         uint32 slot = std::min<uint32>(U(a, 3), uint32(types.size() - 1));
         uint32 page = U(a, 4);
@@ -2904,6 +2909,100 @@ namespace
         Send(p, "ILE~0");
     }
 
+    // IPATCH : run tools/items/make_item_patch.py so the game client knows the server's items
+    // (bag icon, weapon type). Needs the client Data folder on this machine (DevMenu.Items.ClientData).
+    void OpItemPatch(Player* p)
+    {
+        namespace fs = std::filesystem;
+        std::string data = sConfigMgr->GetOption<std::string>("DevMenu.Items.ClientData", "");
+        if (!data.empty() && !fs::is_directory(data))
+            return Err(p, "DevMenu.Items.ClientData is not a folder: " + data);
+        fs::path tool = sConfigMgr->GetOption<std::string>("DevMenu.Items.PatchTool", "");
+        if (tool.empty())   // the module's own copy, found from where this file was compiled
+            tool = fs::path(__FILE__).parent_path().parent_path() / "tools" / "items" / "make_item_patch.py";
+        if (!fs::exists(tool))
+            return Err(p, "Item patch tool not found: " + tool.string() + " (set DevMenu.Items.PatchTool)");
+        if (g_patchBusy.exchange(true))
+            return Err(p, "The item patch is already being made");
+
+        std::error_code ec;   // one folder per realm: two worldservers on one machine must not share items.tsv
+        fs::path dir = fs::temp_directory_path(ec) / ("devmenu_itempatch_" + std::to_string(sConfigMgr->GetOption<int32>("WorldServerPort", 8085)));
+        fs::create_directories(dir, ec);
+        fs::path rows = dir / "items.tsv", log = dir / "last_run.log";
+        {
+            std::ofstream f(rows, std::ios::binary);
+            for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+                f << id << '\t' << it.Class << '\t' << it.SubClass << '\t' << it.SoundOverrideSubclass << '\t' << it.Material
+                  << '\t' << it.DisplayInfoID << '\t' << it.InventoryType << '\t' << it.Sheath << '\n';
+            if (!f)
+            {
+                g_patchBusy = false;
+                return Err(p, "Could not write " + rows.string());
+            }
+        }
+        std::string python = sConfigMgr->GetOption<std::string>("DevMenu.Items.Python", "");
+        if (python.empty())
+        {
+#ifdef _WIN32
+            // a real python.exe on PATH, else the py launcher; the WindowsApps "python" is often only the Store stub
+            python = "python";
+            std::string path = std::getenv("PATH") ? std::getenv("PATH") : "";
+            std::string found, launcher;
+            for (size_t s = 0, e; s <= path.size(); s = e + 1)
+            {
+                e = path.find(';', s);
+                if (e == std::string::npos)
+                    e = path.size();
+                fs::path d = path.substr(s, e - s);
+                if (d.empty())
+                    continue;
+                if (found.empty() && Lower(d.string()).find("windowsapps") == std::string::npos && fs::is_regular_file(d / "python.exe", ec))
+                    found = (d / "python.exe").string();
+                if (launcher.empty() && fs::is_regular_file(d / "py.exe", ec))
+                    launcher = (d / "py.exe").string();
+            }
+            if (!found.empty())
+                python = found;
+            else if (!launcher.empty())
+                python = launcher;
+#else
+            python = "python3";
+#endif
+        }
+        auto q = [](std::string const& s) { return "\"" + s + "\""; };
+        std::error_code cwdErr;
+        std::string here = fs::current_path(cwdErr).string();
+        std::string where = data.empty() ? "auto" : q(data);   // auto: the running game, the registry, folders near the server
+        std::string cmd = q(python) + " " + q(tool.string()) + " --data " + where + " --near " + q(here) + " --rows " + q(rows.string())
+            + " --server-dbc " + q((fs::absolute(sWorld->GetDataPath(), ec) / "dbc").string())
+            + " --first " + std::to_string(ITEM_FIRST) + " --wait 1800";
+        std::string name = sConfigMgr->GetOption<std::string>("DevMenu.Items.PatchName", "");
+        if (!name.empty())
+            cmd += " --patch-name " + q(name);
+        cmd += " > " + q(log.string()) + " 2>&1";
+#ifdef _WIN32
+        cmd = "\"" + cmd + "\"";   // cmd.exe strips one pair of outer quotes
+#endif
+        Ok(p, "Making the client item patch...");
+        std::thread([cmd, log, guid = p->GetGUID()]
+        {
+            int rc = std::system(cmd.c_str());
+            std::string line, last;
+            std::ifstream f(log);
+            while (std::getline(f, line))
+                if (line.find_first_not_of(" \r\t") != std::string::npos)
+                    last = line;
+            if (last.empty())
+                last = "Item patch tool did not run (is Python installed? DevMenu.Items.Python)";
+            LOG_INFO("module", "Dev menu: item patch: {}", last);
+            {
+                std::lock_guard<std::mutex> lock(g_queueLock);
+                g_patchDone.emplace_back(guid, (rc ? "!" : "") + last);
+            }
+            g_patchBusy = false;
+        }).detach();
+    }
+
     // IGET~id : every field of an item made with the menu, to edit it
     void OpItemGet(Player* p, std::vector<std::string> const& a)
     {
@@ -3346,17 +3445,28 @@ namespace
         Ok(p, "Guild '" + clean + "' created, you lead it");
     }
 
-    // ICONUSE~page : the icons (lower-case file names) that at least one item look uses, 12 per message. The icon window
-    // shows only these: any other icon could not be applied to a new item (the game takes the icon from the item's look)
+    // wearable items for the "anything" slot: no bags, ammo or quivers, and no potions / quest items (InventoryType 0)
+    bool FitsSlot(ItemTemplate const& it, uint32 slot)
+    {
+        std::set<uint32> const& t = SLOT_TYPES[std::min<uint32>(slot, uint32(SLOT_TYPES.size() - 1))];
+        if (!t.empty())
+            return t.count(it.InventoryType) != 0;
+        return it.InventoryType != INVTYPE_NON_EQUIP && it.InventoryType != INVTYPE_BAG && it.InventoryType != INVTYPE_AMMO && it.InventoryType != INVTYPE_QUIVER;
+    }
+
+    // ICONUSE~page~slot : the icons (lower-case file names) of the looks of wearable items that fit the slot, 12 per
+    // message. The icon window shows only these: the game takes the icon from the item's look, and a look from
+    // another slot (or from a potion) would not work on the new item.
     void OpIconUse(Player* p, std::vector<std::string> const& a)
     {
-        static std::vector<std::string> names;
-        uint32 page = U(a, 2), per = 12;
+        static std::map<uint32, std::vector<std::string>> cache;
+        uint32 page = U(a, 2), per = 12, slot = std::min<uint32>(U(a, 3, 14), uint32(SLOT_TYPES.size() - 1));
+        std::vector<std::string>& names = cache[slot];
         if (!page || names.empty())
         {
             std::set<uint32> looks;
             for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
-                if (it.DisplayInfoID)
+                if (it.DisplayInfoID && FitsSlot(it, slot))
                     looks.insert(it.DisplayInfoID);
             std::set<std::string> out;
             for (uint32 d : looks)
@@ -3373,7 +3483,7 @@ namespace
         std::string row;
         for (uint32 i = page * per; i < std::min<uint32>(uint32(names.size()), (page + 1) * per); ++i)
             row += (row.empty() ? "" : ",") + names[i];
-        Send(p, Join("ICU", page, pages, row));
+        Send(p, Join("ICU", page, pages, row.empty() ? "-" : row, slot));
     }
 
     void OpIconSearch(Player* p, std::vector<std::string> const& a)
@@ -3385,7 +3495,7 @@ namespace
             return c == std::string::npos ? s : s.substr(c + 1);
         };
         std::string icon = base(S(a, 2));
-        uint32 page = U(a, 3), per = 30;
+        uint32 page = U(a, 3), per = 30, slot = U(a, 4, 14);
         std::set<uint32> good;
         for (uint32 i = 0; i < sItemDisplayInfoStore.GetNumRows(); ++i)
             if (ItemDisplayInfoEntry const* e = sItemDisplayInfoStore.LookupEntry(i))
@@ -3393,7 +3503,7 @@ namespace
                     good.insert(e->ID);
         std::map<uint32, ItemTemplate const*> byLook;
         for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
-            if (good.count(it.DisplayInfoID))
+            if (good.count(it.DisplayInfoID) && FitsSlot(it, slot))
             {
                 auto f = byLook.find(it.DisplayInfoID);
                 if (f == byLook.end() || it.ItemId < f->second->ItemId)
@@ -3675,6 +3785,7 @@ namespace
         if (op == "ILIST") return OpItemList(p);
         if (op == "IGET") return OpItemGet(p, a);
         if (op == "IGIVE") return OpItemGive(p, a);
+        if (op == "IPATCH") return OpItemPatch(p);
         if (op == "ME") return OpMe(p, a);
         if (op == "ICONSEARCH") return OpIconSearch(p, a);
         if (op == "ICONUSE") return OpIconUse(p, a);
@@ -3791,11 +3902,15 @@ public:
     // between map updates: safe to change templates, reload quests/vendors/gossip, spawn and move things
     void OnUpdate(uint32 /*diff*/) override
     {
-        std::vector<std::pair<ObjectGuid, std::string>> work;
+        std::vector<std::pair<ObjectGuid, std::string>> work, patched;
         {
             std::lock_guard<std::mutex> lock(g_queueLock);
             work.swap(g_queue);
+            patched.swap(g_patchDone);
         }
+        for (auto const& [guid, msg] : patched)
+            if (Player* player = ObjectAccessor::FindPlayer(guid))
+                Send(player, Join(msg.rfind('!', 0) == 0 ? "ER" : "OK", Clean(msg.substr(msg.rfind('!', 0) == 0), 400)));   // room for a file path
         for (auto const& [guid, payload] : work)
         {
             Player* player = ObjectAccessor::FindPlayer(guid);

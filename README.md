@@ -89,6 +89,20 @@ It's a plain module: no core patches and no SQL to import. It creates its own ta
 
 Dressed NPCs use the same trick as the Mirror Image spell, so every unmodified 3.3.5a client shows them, no client patch needed. Weapons are normal NPC equipment.
 
+### Created items in the bags: the client item patch
+
+A 3.3.5 client takes an item's type and bag icon from its own `Item.dbc`. Items made in *Create an item* only exist on the server, so until the client gets them they show a red question mark in the bags and weapons don't register as weapons (tooltips, quest rewards and the Dev Menu look fine).
+
+**In game:** press **Fix bag icons** on the *Create an item* page (or **Make client item patch** in *Items created*), then restart the game; the menu tells you when the file is written. The server finds the game you pressed it in when both run on the same PC (needs Python 3 on the server PC). With no game on the server PC (hosted or Linux server), the patch is made from the server's own `dbc/Item.dbc` into `client_patch/` next to the worldserver, for you to hand out. To point at a client yourself, set `DevMenu.Items.ClientData` in `mod_ilusixn_devmenu.conf` to the game's `Data` folder. The patch name is picked so the client loads it: `patch-ZZZZZZI.MPQ` on clients that load long names, a free one-letter name like `patch-Z.MPQ` on stock 3.3.5 clients (`DevMenu.Items.PatchName` forces one).
+
+**By hand** (or when the server runs elsewhere), after creating items run:
+
+```
+python tools/items/make_item_patch.py --data "<WoW folder>/Data" --user <mysql user> --password <mysql password>
+```
+
+It adds every item your world database has and the client doesn't to a copy of the client's `Item.dbc`, in a client patch (put it in the client `Data` folder, players too, and restart the game). Run it again after creating or changing items. `--only-devmenu` limits it to the Dev Menu id range; `-h` lists every option.
+
 ### Sharing dressed NPCs without the module: baking
 
 Dressed NPCs need this module on the server that shows them. To share them with servers that don't run it, bake them after *Export SQL*:

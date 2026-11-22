@@ -298,7 +298,7 @@ local waiting = false
 local function Run()
     list:Search(function(pg)
         waiting = true
-        if iconMode then Send("ICONSEARCH", iconMode, pg) else Send("ISEARCH", srch:GetText(), SlotIndex(), pg, "", 1, 1) end
+        if iconMode then Send("ICONSEARCH", iconMode, pg, SlotIndex()) else Send("ISEARCH", srch:GetText(), SlotIndex(), pg, "", 1, 1) end
     end)
 end
 srch:SetScript("OnEnterPressed", function(self) self:ClearFocus(); iconMode = nil; Run() end)
@@ -414,6 +414,9 @@ local mdel = Button(mine, "Delete the selected one", 180, 26, "danger", function
     if mlist.sel then Send("IDEL", mlist.sel); Send("ILIST") end
 end)
 mdel:SetPoint("BOTTOMLEFT", 12, 12)
+local mpatch = Button(mine, "Make client item patch", 180, 26, "accent", function() Send("IPATCH") end)
+mpatch:SetPoint("LEFT", mdel, "RIGHT", 8, 0)
+Tip(mpatch, "Make client item patch", "Fixes red question marks and weapons that do not count as weapons: the server finds this game and writes its item file (the server must run on this PC, or set DevMenu.Items.ClientData). The new file is put in place when you close the game; restart it after. Players need the same file.")
 local mclose = Button(mine, "Close", 80, 26, nil, function() mine:Hide() end); mclose:SetPoint("BOTTOMRIGHT", -12, 12)
 local favOnly = false
 local favC = Check(mine, "Favorites only", function(v) favOnly = v; mlist:Rebuild() end)
@@ -435,6 +438,9 @@ H.ILE = function() mlist:Rebuild() end
 H.IDL = function() Send("ILIST") end
 myB = Button(p, "Items created", 110, 24, nil, function() Send("ILIST"); mine:Show() end)
 myB:SetPoint("TOPRIGHT", -14, -10)
+local fixB = Button(p, "Fix bag icons", 110, 24, "accent", function() Send("IPATCH") end)
+fixB:SetPoint("RIGHT", myB, "LEFT", -6, 0)
+Tip(fixB, "Fix bag icons", "Items you create only exist on the server: until the game gets them they show a red question mark in the bags and weapons do not count as weapons. This saves them into the game's files (same as Make client item patch), then restart the game. Players need the same file. If the server is on another computer, the file is made on the server: the message says where.")
 
 -- edit: the server sends every field back
 local loading
@@ -502,33 +508,21 @@ Skin(icp, { 0.05, 0.055, 0.07, 0.99 }, C.border)
 icp:SetPoint("TOPLEFT", 16, -42); icp:SetSize(698, 500); icp:SetFrameLevel(p:GetFrameLevel() + 40); icp:Hide()
 local ich = Header(icp, "Choose an icon (like the macro icon window)"); ich:SetPoint("TOPLEFT", 12, -12)
 local icons = {}
-local function LoadIcons()
-    if #icons > 0 then return end
-    icons[1] = "INV_MISC_QUESTIONMARK"
-    local function Add(n) if n then n = tostring(n):match("[^\\/]*$"); icons[#icons + 1] = n end end
-    -- 3.3.5 API (count + info) first; the table-filling API of later clients as a fallback
-    if GetNumMacroIcons and GetMacroIconInfo then for i = 1, GetNumMacroIcons() do Add(GetMacroIconInfo(i)) end end
-    if GetNumMacroItemIcons and GetMacroItemIconInfo then for i = 1, GetNumMacroItemIcons() do Add(GetMacroItemIconInfo(i)) end end
-    if #icons < 10 then
-        local t = {}
-        if GetMacroIcons then pcall(GetMacroIcons, t) end
-        if GetMacroItemIcons then pcall(GetMacroItemIcons, t) end
-        for _, n in ipairs(t) do Add(n) end
-    end
-end
--- only icons that some item look uses can be applied: the server lists them, we keep the matching ones
-local usable, usableDone
+-- only icons of wearable items for the slot being made can be applied (the game takes the icon from the item's
+-- look): the server lists them per slot, nothing is shown until its list is in
+local usable, wantSlot = {}, nil   -- usable[slot] = { done = bool, list = { icon file names } }
+local IcShow
 local function Filter()
-    if not usable or not usableDone then return end
-    local keep = {}
-    for _, n in ipairs(icons) do if usable[n:lower()] then keep[#keep + 1] = n end end
-    if #keep > 0 then icons = keep end
+    local u = usable[wantSlot]
+    icons = (u and u.done) and u.list or {}
 end
 H.ICU = function(a)
-    usable = usable or {}
-    for n in (a[4] or ""):gmatch("[^,]+") do usable[n] = true end
-    local pg, pages = tonumber(a[2]) or 0, tonumber(a[3]) or 1
-    if pg + 1 < pages then Send("ICONUSE", pg + 1) else usableDone = true; Filter(); if icp:IsShown() then icp:GetScript("OnShow")() end end
+    local pg, pages, slot = tonumber(a[2]) or 0, tonumber(a[3]) or 1, tonumber(a[5]) or 14
+    local u = usable[slot]; if not u then u = { list = {} }; usable[slot] = u end
+    u.t = GetTime()
+    if pg == 0 then u.list = {} end
+    for n in (a[4] or ""):gmatch("[^,]+") do if n ~= "-" then u.list[#u.list + 1] = n end end
+    if pg + 1 < pages then Send("ICONUSE", pg + 1, slot) else u.done = true; if icp:IsShown() and slot == wantSlot then IcShow() end end
 end
 local COLS, ROWS, CELL = 14, 9, 44
 local icOff, icCells = 0, {}
@@ -568,12 +562,16 @@ icp:SetScript("OnMouseWheel", function(self, d) icSlider:SetValue(math.max(0, ma
 local icNote = Text(icp, 10, C.dim); icNote:SetPoint("TOPLEFT", 14, -454); icNote:SetWidth(660); icNote:SetJustifyH("LEFT")
 icNote:SetText("Click an icon: the list then shows the items that use it. Pick one and your new item gets that look and icon. Only icons that an item look can carry are shown (the game takes the icon from the item's look).")
 local icX = Button(icp, "Close", 80, 24, nil, function() icp:Hide() end); icX:SetPoint("BOTTOMRIGHT", -12, 12)
-icp:SetScript("OnShow", function()
-    LoadIcons()
-    if not usableDone and not usable then Send("ICONUSE", 0) end
+local NOTE = "Click an icon: the list then shows the items that use it. Pick one and your new item gets that look and icon. Only icons of wearable items that fit the slot you are making are shown (the game takes the icon from the item's look)."
+IcShow = function()
+    wantSlot = SlotIndex()
+    local u = usable[wantSlot]   -- ask again if a list never finished (lost reply, server restart)
+    if not u or (not u.done and GetTime() - (u.t or 0) > 10) then usable[wantSlot] = { list = {}, t = GetTime() }; Send("ICONUSE", 0, wantSlot) end
     Filter()
+    icNote:SetText(usable[wantSlot].done and NOTE or "Loading the icons for this slot...")
     icSlider:SetMinMaxValues(0, math.max(0, math.ceil(#icons / COLS) - ROWS)); icSlider:SetValue(0); icOff = 0; IcRefresh()
-end)
+end
+icp:SetScript("OnShow", IcShow)
 local icB = Button(p, "Customise icon", 250, 22, nil, function() icp:Show() end)
 icB:SetPoint("TOPLEFT", 372 + 70, -250)
-Tip(icB, "Customise icon", "Open the icon window: pick any game icon and see which items use it, then take its look.")
+Tip(icB, "Customise icon", "Open the icon window: pick an icon of an item that fits this slot and see which items use it, then take its look.")

@@ -24,3 +24,37 @@ DevMenu.MinSecurity = 2
 #        Default:     0
 
 DevMenu.Items.FirstId = 0
+
+#    DevMenu.Items.ClientData
+#        Description: The game client's Data folder on this machine, for the "Make client item patch" button
+#                     (Create an item > Items created). The button writes the client's Item.dbc with your server's
+#                     items in it, which fixes red question marks in the bags and weapons that do not count as weapons.
+#                     Empty = found automatically: the game you press the button in (same machine as the server),
+#                     else the WoW registry entry, else a client in the folders around the server.
+#                     No client on the server machine (hosted server, Linux): the patch is made from the server's
+#                     own dbc/Item.dbc into client_patch/ next to the worldserver, for you to hand out.
+#                     Example: "D:/Games/World of Warcraft/Data"
+#        Default:     ""
+
+DevMenu.Items.ClientData = ""
+
+#    DevMenu.Items.PatchName
+#        Description: Name of the client patch the button writes. Empty = chosen for you: one that loads after the
+#                     archive holding the client's Item.dbc (patch-ZZZZZZI.MPQ on clients that load long names,
+#                     else a free one-letter name like patch-Z.MPQ, which stock 3.3.5 clients load).
+#                     Set it only to force a name; the tool refuses one that would load too early.
+#        Default:     ""
+
+DevMenu.Items.PatchName = ""
+
+#    DevMenu.Items.Python
+#        Description: Python 3 command the button runs. Empty = "python" on Windows, "python3" elsewhere.
+#        Default:     ""
+
+DevMenu.Items.Python = ""
+
+#    DevMenu.Items.PatchTool
+#        Description: Path of tools/items/make_item_patch.py. Empty = the copy in this module's source folder.
+#        Default:     ""
+
+DevMenu.Items.PatchTool = ""
